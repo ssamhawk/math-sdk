@@ -14,6 +14,7 @@ import numpy as np
 import zstandard as zst
 import hashlib
 import pickle
+from math import isclose
 from utils.analysis.distribution_functions import (
     make_win_distribution,
     get_distribution_moments,
@@ -177,12 +178,18 @@ def get_num_non_zero_payouts(book_int_payouts) -> None:
 def verify_mode_volatility(name: str, MathStats: object) -> dict:
     """Check math betlevel volatility limits. Returns dict of violated attributes."""
     mode_limits = {"prob5k": 1e-2, "prob10k": 0.5e-2, "etl40b": 0.9, "etl10k": 0.8, "cvar": 800, "rtp": 0.967}
+    # The optimizer targets the rtp limit exactly, so its result can land a few ulps above it.
+    # Treat that float residue as passing; limits without an entry keep the strict comparison.
+    limit_rel_tol = {"rtp": 1e-9}
     violated_attributes = {}
 
     for key, limit in mode_limits.items():
         val = getattr(MathStats, key, None)
-        if val is not None and val > limit:
-            violated_attributes[key] = val
+        if val is None or val <= limit:
+            continue
+        if isclose(val, limit, rel_tol=limit_rel_tol.get(key, 0.0)):
+            continue
+        violated_attributes[key] = val
 
     if violated_attributes:
         warnings.warn(f"\nMode [{name}] fails 3-star volatility limits:\n")
