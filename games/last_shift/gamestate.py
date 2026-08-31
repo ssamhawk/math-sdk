@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, replace
 import random
 from typing import Sequence
@@ -9,11 +10,23 @@ from typing import Sequence
 from games.last_shift.game_calculations import (
     Board,
     DepartureGroup,
+    WinningGroup,
+    apply_departure_modifier,
+    apply_level_modifier,
+    derive_contribution_bucket,
     derive_scatter_positions,
+    evaluate_pay_anywhere,
+    load_selected_columns,
+    make_departure_groups,
+    modifier_reason_for,
+    select_cargo_columns,
+    serialize_wins,
     validate_board,
 )
+from games.last_shift.contract_fixtures import CARGO_BOARD, LOSS_BOARD
 from games.last_shift.game_config import GameConfig
 from games.last_shift.game_events import EventLedger
+from src.state.state import GeneralGameState
 
 
 STAGES = ("yard", "mainline", "redline")
@@ -292,3 +305,148 @@ class LastShiftStateMachine:
             raise ValueError("bonus payout must be ledger-derived")
         ledger.bonus_complete(ledger.feature_payout_units)
         return self.complete_round(state, ledger)
+
+
+class GameState(GeneralGameState):
+    """Stake SDK adapter for the two deterministic contract-proof books."""
+
+    _SUPPORTED_CRITERIA = frozenset({"contract_loss", "contract_departure"})
+
+    def assign_special_sym_function(self) -> None:
+        self.special_symbol_functions = {}
+
+    def run_freespin(self) -> None:
+        raise RuntimeError("contract_proof does not cover freegame integration")
+
+    def run_spin(self, sim: int, simulation_seed=None) -> None:
+        if self.criteria not in self._SUPPORTED_CRITERIA:
+            raise ValueError(f"unsupported contract_proof criterion: {self.criteria}")
+
+        self.reset_seed(sim, simulation_seed)
+        self.reset_book()
+        ledger, final_state = self._produce_contract_book(self.criteria)
+
+        self.book.events = deepcopy(ledger.events)
+        final_units = ledger.events[-1]["finalPayoutUnits"]
+        final_multiplier = final_units / self.config.payout_scale
+        self.win_manager.update_spinwin(final_multiplier)
+        self.win_manager.update_gametype_wins(self.gametype)
+        self.update_final_win()
+        self._last_shift_state = final_state
+        self.imprint_wins()
+
+    def _produce_contract_book(self, criterion: str) -> tuple[EventLedger, RoundState]:
+        state = RoundState()
+        ledger = EventLedger(
+            self.config.wincap_units,
+            payout_quantum_units=self.config.payout_quantum_units,
+        )
+        ledger.round_start(
+            mode=state.mode,
+            levels=state.column_levels,
+            departures=state.departures,
+            stage=state.stage,
+            free_spins_remaining=state.free_spins_remaining,
+        )
+
+        if criterion == "contract_loss":
+            ledger.board_reveal(LOSS_BOARD)
+            ledger.no_win()
+        elif criterion == "contract_departure":
+            state = self._produce_departure(state, ledger)
+        else:  # Defensive even though run_spin rejects before resetting a book.
+            raise ValueError(f"unsupported contract_proof criterion: {criterion}")
+
+        final_levels = (0, 0, 0, 0, 0, 0)
+        ledger.round_complete(final_levels)
+        return ledger, RoundState(
+            column_levels=final_levels,
+            round_payout_units=ledger.round_payout_units,
+            capped=ledger.capped,
+        )
+
+    def _produce_departure(self, state: RoundState, ledger: EventLedger) -> RoundState:
+        board = CARGO_BOARD
+        ledger.board_reveal(board)
+        modifier_reason = None
+
+        for load_level in (1, 2, 3):
+            evaluated, payout_units = evaluate_pay_anywhere(board, self.config)
+            ledger.win_result(
+                payout_units,
+                groups=serialize_wins(evaluated),
+                contribution_bucket=derive_contribution_bucket(
+                    state.mode, modifier_reason, ()
+                ),
+            )
+            winning_positions = sorted(
+                {position for win in evaluated for position in win.positions}
+            )
+            ledger.symbols_remove(winning_positions)
+            selections = select_cargo_columns(
+                board,
+                tuple(WinningGroup(win.symbol, win.positions) for win in evaluated),
+                self.config,
+            )
+            next_levels, transitions = load_selected_columns(
+                state.column_levels, selections
+            )
+            ledger.columns_load(transitions)
+            state = replace(state, column_levels=next_levels)
+
+            if load_level < 3:
+                ledger.cascade_refill(CARGO_BOARD)
+                board, changes = self._apply_level_modifiers(
+                    CARGO_BOARD, transitions
+                )
+                modifier_reason = modifier_reason_for(transitions)
+                ledger.board_modifier(modifier_reason, changes, board)
+                continue
+
+            completed_columns = tuple(
+                transition.column
+                for transition in transitions
+                if transition.level_after == 3
+            )
+            groups = make_departure_groups(
+                completed_columns,
+                state.stage,
+                {2: 2, 3: 3},
+                departure_sequence=1,
+                mode=state.mode,
+            )
+            for group in groups:
+                ledger.departure_prepare(group)
+            ledger.cascade_refill(CARGO_BOARD)
+            board, changes = apply_departure_modifier(
+                CARGO_BOARD, groups, self.config
+            )
+            ledger.board_modifier("departure", changes, board)
+            evaluated, payout_units = evaluate_pay_anywhere(
+                board, self.config, groups
+            )
+            ledger.win_result(
+                payout_units,
+                groups=serialize_wins(evaluated),
+                applied_departure_ids=tuple(
+                    group.departure_id for group in groups
+                ),
+                contribution_bucket=derive_contribution_bucket(
+                    state.mode, "departure", groups
+                ),
+            )
+            state = LastShiftStateMachine(self.config).resolve_departures(
+                state, ledger, groups
+            )
+
+        return state
+
+    def _apply_level_modifiers(self, board, transitions):
+        resulting_board = board
+        changes = []
+        for transition in transitions:
+            resulting_board, transition_changes = apply_level_modifier(
+                resulting_board, transition, self.config
+            )
+            changes.extend(transition_changes)
+        return resulting_board, tuple(changes)

@@ -4,7 +4,9 @@ This stage deliberately contains no reel weights, tuned RTP, or simulation
 distributions. Those belong to T4-C2 after the rule skeleton is approved.
 """
 
+from src.config.betmode import BetMode
 from src.config.config import Config
+from src.config.distributions import Distribution
 
 
 class GameConfig(Config):
@@ -111,5 +113,41 @@ class GameConfig(Config):
             "natural": ("basegame", "natural_bonus"),
             "forced": ("forced_bonus", "forced_wincap", "forced_contract"),
         }
-        self.bet_modes = []
+        self.contract_proof_only = True
+        self.bet_modes = [
+            BetMode(
+                name="contract_proof",
+                cost=1.0,
+                rtp=0.0,
+                max_win=self.wincap,
+                auto_close_disabled=False,
+                is_feature=False,
+                is_buybonus=False,
+                distributions=[
+                    Distribution(
+                        criteria="contract_loss",
+                        fixed_amt=1,
+                        conditions={
+                            "force_wincap": False,
+                            "force_freegame": False,
+                        },
+                        required_distribution_conditions=[],
+                    ),
+                    Distribution(
+                        criteria="contract_departure",
+                        fixed_amt=1,
+                        conditions={
+                            "force_wincap": False,
+                            "force_freegame": False,
+                        },
+                        required_distribution_conditions=[],
+                    ),
+                ],
+            )
+        ]
         self._last_shift_initialized = True
+
+    def assert_publishable_config(self) -> None:
+        """Reject the deterministic contract fixture at every release boundary."""
+        if self.contract_proof_only:
+            raise RuntimeError("contract_proof configuration is not publishable")
