@@ -21,9 +21,10 @@ __pycache__
 **/optimization_files/**
 
 /env
+/.build/
+/build/
 *.env
 *.DS_Store
 *.toml
 
 **/site/*
-

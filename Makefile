@@ -1,6 +1,7 @@
 PYTHON := python3
 VENV_DIR := env
 VENV_PY := $(VENV_DIR)/bin/python
+WHEEL_DIR := .build/wheels
 TEST_NAMES = 0_0_cluster 0_0_scatter 0_0_lines 0_0_expwilds 0_0_ways 0_0_lines_feature_match
 
 ifeq ($(OS),Windows_NT)
@@ -13,14 +14,15 @@ endif
 makeVirtual:
 	$(PYTHON) -m venv $(VENV_DIR)
 
-pipInstall: makeVirtual
-	$(VENV_PY) -m pip install --upgrade pip
+pipPackages: makeVirtual
+	$(VENV_PY) -m pip install --require-hashes -r requirements.lock
 
-pipPackages: pipInstall
-	$(VENV_PY) -m pip install -r requirements.txt
+buildPackage: pipPackages
+	mkdir -p $(WHEEL_DIR)
+	$(VENV_PY) -m pip wheel --no-deps --no-build-isolation --wheel-dir $(WHEEL_DIR) .
 
-packInstall: pipPackages
-	$(VENV_PY) -m pip install -e .
+packInstall: buildPackage
+	$(VENV_PY) -m pip install --no-index --find-links $(WHEEL_DIR) stakeengine==0.0.0
 
 setup: packInstall
 	@echo "Virtual environment ready."

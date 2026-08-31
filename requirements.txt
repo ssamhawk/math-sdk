@@ -4,6 +4,7 @@ iniconfig==2.1.0
 jmespath==1.0.1
 numpy==2.2.5
 packaging==25.0
+pip==25.0.1
 pluggy==1.6.0
 pytest==8.3.5
 python-dateutil==2.9.0.post0
@@ -12,6 +13,7 @@ s3transfer==0.10.4
 setuptools==80.8.0
 six==1.17.0
 urllib3==2.4.0
+wheel==0.45.1
 xlsxwriter==3.2.0
 zstandard==0.23.0
 toml==0.10.2
