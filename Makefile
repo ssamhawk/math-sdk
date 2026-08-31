@@ -46,7 +46,7 @@ test:
 	$(VENV_PY) -m pytest tests/
 
 smokeInstalled:
-	cd /private/tmp && $(abspath $(VENV_PY)) -c "import games.last_shift.game_config as m; assert 'site-packages' in m.__file__; print(m.__file__)"
+	cd /private/tmp && "$(abspath $(VENV_PY))" -c "import games.last_shift.game_config as m; assert 'site-packages' in m.__file__; print(m.__file__)"
 
 test_run:
 	@for f in $(TEST_NAMES); do \
