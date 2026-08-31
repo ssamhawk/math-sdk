@@ -342,14 +342,40 @@ class GameState(GeneralGameState):
         canonical_library = (
             Path(PATH_TO_GAMES) / "last_shift" / "library"
         ).resolve()
-        target_library = Path(self.output_files.library_path).resolve()
-        if (
-            target_library == canonical_library
-            or canonical_library in target_library.parents
-        ):
-            raise RuntimeError(
-                "contract_proof cannot write to the canonical Last Shift library"
-            )
+        for target_path in self._cached_output_paths():
+            if (
+                target_path == canonical_library
+                or canonical_library in target_path.parents
+            ):
+                raise RuntimeError(
+                    "contract_proof cannot write to the canonical Last Shift "
+                    f"library: {target_path}"
+                )
+
+    def _cached_output_paths(self):
+        values = list(vars(self.output_files).values())
+        visited_containers = set()
+        while values:
+            value = values.pop()
+            if isinstance(value, (str, Path)):
+                path = Path(value)
+                if path.is_absolute():
+                    yield path.resolve()
+                continue
+
+            if isinstance(value, dict):
+                container_id = id(value)
+                if container_id in visited_containers:
+                    continue
+                visited_containers.add(container_id)
+                values.extend(value.keys())
+                values.extend(value.values())
+            elif isinstance(value, (list, tuple, set, frozenset)):
+                container_id = id(value)
+                if container_id in visited_containers:
+                    continue
+                visited_containers.add(container_id)
+                values.extend(value)
 
     def _produce_contract_book(self, criterion: str) -> tuple[EventLedger, RoundState]:
         state = RoundState()

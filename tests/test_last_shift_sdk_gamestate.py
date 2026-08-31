@@ -150,6 +150,22 @@ def test_release_and_default_output_guards_fail_before_mutation(tmp_path):
             compress=False,
             profiling=False,
         )
+
+    split_config = deepcopy(GameConfig())
+    split_game = GameState(split_config)
+    split_game.output_files.library_path = str(tmp_path / "decoy_library")
+    split_game.betmode = "contract_proof"
+    split_game.criteria = "contract_departure"
+    split_book_before = deepcopy(split_game.book.to_json())
+    split_library_before = deepcopy(split_game.library)
+    split_payouts_before = list(split_game._payout_ints)
+
+    with pytest.raises(RuntimeError, match="canonical Last Shift library"):
+        split_game.run_spin(0, 2)
+    assert split_game.book.to_json() == split_book_before
+    assert split_game.library == split_library_before
+    assert split_game._payout_ints == split_payouts_before
+
     files_after = sorted(
         str(path.relative_to(real_library))
         for path in real_library.rglob("*")
