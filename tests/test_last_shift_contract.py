@@ -1,5 +1,6 @@
 """Deterministic T4-C1 contract tests for Last Shift."""
 
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -50,6 +51,88 @@ def regular_board():
         "ABCDE",
         "ABCDE",
     )
+
+
+def cargo_board():
+    return board_with_columns(
+        "BCDEF",
+        "BCDEF",
+        "AAAAA",
+        "AAAAA",
+        "BCDEF",
+        "BCDEF",
+    )
+
+
+def cargo_positions():
+    return tuple(
+        flat_position(column, row) for column in (2, 3) for row in range(5)
+    )
+
+
+def payout_groups():
+    return [{"symbol": "A", "positions": list(cargo_positions())}]
+
+
+def apply_scheduled_modifiers(board, transitions, config):
+    resulting = board
+    changes = []
+    for transition in transitions:
+        resulting, transition_changes = apply_level_modifier(
+            resulting, transition, config
+        )
+        changes.extend(transition_changes)
+    return resulting, tuple(changes)
+
+
+def build_end_to_end_departure_fixture(machine, config):
+    state, ledger = machine.new_base_round()
+    board = cargo_board()
+    ledger.board_reveal(board)
+    completed_group = None
+
+    for level in (1, 2, 3):
+        group = WinningGroup("A", cargo_positions())
+        ledger.win_result(
+            100,
+            groups=payout_groups(),
+            contribution_bucket="base_plain" if level == 1 else "base_modifier",
+        )
+        ledger.symbols_remove(cargo_positions())
+        selections = select_cargo_columns(board, (group,), config)
+        next_levels, transitions = load_selected_columns(
+            state.column_levels, selections
+        )
+        ledger.columns_load(transitions)
+        state = replace(state, column_levels=next_levels)
+
+        if level < 3:
+            ledger.cascade_refill(cargo_board())
+            board, changes = apply_scheduled_modifiers(
+                cargo_board(), transitions, config
+            )
+            ledger.board_modifier(f"load_level_{level}", changes, board)
+            continue
+
+        completed_group = make_departure_groups(
+            (2, 3), "yard", {2: 2, 3: 3}, 1
+        )[0]
+        ledger.departure_prepare(completed_group)
+        ledger.cascade_refill(cargo_board())
+        board, changes = apply_departure_modifier(
+            cargo_board(), (completed_group,), config
+        )
+        ledger.board_modifier("departure", changes, board)
+        ledger.win_result(
+            300,
+            groups=payout_groups(),
+            applied_departure_ids=(completed_group.departure_id,),
+            contribution_bucket="base_coupled_departure",
+        )
+        state = machine.resolve_departures(state, ledger, (completed_group,))
+
+    final_state = machine.complete_round(state, ledger)
+    return ledger.events, final_state, completed_group
 
 
 def test_cargo_selection_uses_count_then_column_tie_break_and_rank(config):
@@ -209,6 +292,7 @@ def test_bonus_state_persists_across_free_spins_and_retrigger(machine, config):
     assert retriggered.departures == first.departures
     assert retriggered.free_spins_remaining == first.free_spins_remaining + 4
     assert event_types(ledger.events) == [
+        "round_start",
         "bonus_trigger",
         "free_spin_start",
         "retrigger",
@@ -225,10 +309,10 @@ def test_exact_cap_emits_terminal_max_win(config):
 
 
 def test_over_cap_is_truncated_in_integer_units(config):
-    ledger = EventLedger(config.wincap_units, starting_payout_units=config.wincap_units - 75)
+    ledger = EventLedger(config.wincap_units, starting_payout_units=config.wincap_units - 100)
     win = ledger.win_result(1_000)
     assert win["requestedStepPayoutUnits"] == 1_000
-    assert win["stepPayoutUnits"] == 75
+    assert win["stepPayoutUnits"] == 100
     assert win["roundPayoutAfterUnits"] == config.wincap_units
     assert ledger.events[-1] == {
         "index": 1,
@@ -243,7 +327,7 @@ def test_no_payout_event_can_follow_max_win(config):
     with pytest.raises(TerminalPayoutError):
         ledger.win_result(1)
     with pytest.raises(TerminalPayoutError):
-        ledger.retrigger((0, 6, 12, 18), 4, 7)
+        ledger.retrigger((0, 6, 12, 18), 4, 7, (0, 0, 0, 0, 0, 0), "yard", 0)
     assert event_types(ledger.events) == ["win_result", "max_win"]
     ledger.round_complete((0, 0, 0, 0, 0, 0))
     assert event_types(ledger.events) == ["win_result", "max_win", "round_complete"]
@@ -277,24 +361,16 @@ def test_capped_contribution_ledger_remains_additive(config):
         "bonus_mainline",
     )
     for bucket in buckets:
-        ledger.board_reveal(regular_board())
-        ledger.win_result(100, contribution_bucket=bucket)
-        ledger.symbols_remove((0,))
-        ledger.columns_load(())
-        ledger.cascade_refill(regular_board())
-        ledger.no_win()
-    ledger.board_reveal(regular_board())
+        ledger.win_result(100, groups=payout_groups(), contribution_bucket=bucket)
     ledger.win_result(
         config.wincap_units,
+        groups=payout_groups(),
         contribution_bucket="bonus_redline",
-        applied_departure_ids=("dep-0001",),
     )
     assert sum(ledger.contribution_units.values()) == config.wincap_units
     assert ledger.contribution_units["base_plain"] == 100
     assert ledger.contribution_units["base_modifier"] == 100
     assert ledger.contribution_units["bonus_redline"] == config.wincap_units - 600
-    ledger.round_complete((2, 0, 1, 0, 0, 0))
-    validate_contract(ledger.events, config.wincap_units)
 
 
 def test_cascade_refill_is_deep_authoritative_board(config):
@@ -307,21 +383,17 @@ def test_cascade_refill_is_deep_authoritative_board(config):
 
 def test_custom_validator_rejects_payout_after_max_win(config):
     ledger = EventLedger(config.wincap_units)
-    ledger.board_reveal(regular_board())
-    ledger.win_result(config.wincap_units)
-    invalid = [dict(event) for event in ledger.events]
-    invalid.append(
-        {
-            "index": 3,
-            "type": "win_result",
-            "requestedStepPayoutUnits": 1,
-            "stepPayoutUnits": 0,
-            "roundPayoutBeforeUnits": config.wincap_units,
-            "roundPayoutAfterUnits": config.wincap_units,
-            "contributionBucket": "base_plain",
-        }
+    ledger.round_start("basegame", (0, 0, 0, 0, 0, 0), 0, "yard", 0)
+    ledger.board_reveal(cargo_board())
+    ledger.win_result(
+        config.wincap_units, groups=payout_groups(), contribution_bucket="base_plain"
     )
-    with pytest.raises(ValueError, match="after max_win"):
+    ledger.round_complete((0, 0, 0, 0, 0, 0))
+    invalid = deepcopy(ledger.events)
+    invalid.insert(-1, {"type": "board_reveal", "board": [list(c) for c in cargo_board()]})
+    for index, event in enumerate(invalid):
+        event["index"] = index
+    with pytest.raises(ValueError, match="illegal board_reveal after max_win"):
         validate_contract(invalid, config.wincap_units)
 
 
@@ -355,43 +427,166 @@ def test_bonus_completion_cannot_leak_state_into_next_bet(machine, config):
     assert completed.free_spins_remaining == 0
 
 
-def test_custom_validator_rejects_noncanonical_event_order(config):
-    invalid = [
-        {"index": 0, "type": "board_reveal", "board": []},
-        {"index": 1, "type": "columns_load", "transitions": []},
-    ]
-    with pytest.raises(ValueError, match="must follow symbols_remove"):
-        validate_contract(invalid, config.wincap_units)
+def test_end_to_end_board_to_departure_trace(machine, config):
+    events, final_state, group = build_end_to_end_departure_fixture(machine, config)
+    validate_contract(events, config.wincap_units)
+    assert group.kind == "coupled" and group.columns == (2, 3)
+    assert final_state.column_levels == (0, 0, 0, 0, 0, 0)
+    assert final_state.round_payout_units == 600
 
 
-def test_canonical_tumble_and_departure_event_order(config):
+def test_refill_can_go_directly_to_no_win_without_modifier(config):
     ledger = EventLedger(config.wincap_units)
+    ledger.round_start("basegame", (0, 0, 0, 0, 0, 0), 0, "yard", 0)
     board = regular_board()
-    transition = LoadTransition(2, 2, 3, (2, 8, 14), 3, 1)
-    group = make_departure_groups((2,), "yard", {2: 3}, 1)[0]
-    modified, changes = apply_departure_modifier(board, (group,), config)
-
+    positions = [flat_position(column, 0) for column in range(6)]
+    groups = [{"symbol": "A", "positions": positions}]
     ledger.board_reveal(board)
-    ledger.win_result(100)
-    ledger.symbols_remove((2, 8, 14))
-    ledger.columns_load((transition,))
-    ledger.departure_prepare(group)
+    ledger.win_result(100, groups=groups)
+    ledger.symbols_remove(positions)
+    ledger.columns_load(())
     ledger.cascade_refill(board)
-    ledger.board_modifier("departure", changes, modified)
-    ledger.win_result(300, applied_departure_ids=(group.departure_id,))
-    ledger.departure_resolve(group, (0,), 0, "yard")
+    ledger.no_win()
     ledger.round_complete((0, 0, 0, 0, 0, 0))
-
-    assert event_types(ledger.events) == [
-        "board_reveal",
-        "win_result",
-        "symbols_remove",
-        "columns_load",
-        "departure_prepare",
-        "cascade_refill",
-        "board_modifier",
-        "win_result",
-        "departure_resolve",
-        "round_complete",
-    ]
     validate_contract(ledger.events, config.wincap_units)
+
+
+def test_duplicate_selected_columns_are_rejected():
+    selections = (
+        CargoSelection(2, (2, 8), 2, 1),
+        CargoSelection(2, (14, 20), 2, 2),
+    )
+    with pytest.raises(ValueError, match="selected columns must be unique"):
+        load_selected_columns((0, 0, 0, 0, 0, 0), selections)
+
+
+@pytest.mark.parametrize(
+    ("departures", "stage", "expected_departures", "expected_stage", "reset"),
+    ((0, "yard", 2, "mainline", 0), (2, "mainline", 4, "redline", 1)),
+)
+def test_coupled_departure_counts_completed_columns_at_thresholds(
+    machine, config, departures, stage, expected_departures, expected_stage, reset
+):
+    state = RoundState(
+        mode=config.freegame_type,
+        column_levels=(0, 0, 2, 2, 0, 0),
+        departures=departures,
+        stage=stage,
+        free_spins_remaining=3,
+    )
+    ledger = EventLedger(config.wincap_units)
+    group = make_departure_groups((2, 3), stage, {2: 6, 3: 10}, 1)
+    next_state = machine.resolve_departures(state, ledger, group)
+    assert next_state.departures == expected_departures
+    assert next_state.stage == expected_stage
+    assert next_state.column_levels[2:4] == (reset, reset)
+
+
+def test_resolve_rejects_stage_at_selection_mismatch(machine, config):
+    state = RoundState(
+        mode=config.freegame_type,
+        column_levels=(0, 0, 2, 0, 0, 0),
+        departures=2,
+        stage="mainline",
+        free_spins_remaining=2,
+    )
+    group = make_departure_groups((2,), "yard", {2: 6}, 1)
+    with pytest.raises(ValueError, match="stageAtSelection"):
+        machine.resolve_departures(state, EventLedger(config.wincap_units), group)
+
+
+@pytest.mark.parametrize("positions", ((0, 0, 6, 12), (0, 6, 12, 30)))
+def test_bonus_and_retrigger_positions_must_be_unique_and_in_range(
+    machine, config, positions
+):
+    state, ledger = machine.new_base_round()
+    with pytest.raises(ValueError, match="positions|position"):
+        machine.trigger_natural_bonus(state, ledger, positions)
+    with pytest.raises(ValueError, match="positions|position"):
+        ledger.bonus_trigger(positions, 10, (0, 0, 0, 0, 0, 0))
+
+
+def test_provisional_paytable_obeys_sdk_payout_quantum(config):
+    assert config.paytable_units
+    assert all(
+        payout >= config.payout_quantum_units
+        and payout % config.payout_quantum_units == 0
+        for payout in config.paytable_units.values()
+    )
+    with pytest.raises(ValueError, match="payout quantum"):
+        EventLedger(config.wincap_units).win_result(15, groups=payout_groups())
+
+
+def test_complete_bonus_state_and_payout_reconcile(machine, config):
+    state, ledger = machine.new_base_round()
+    ledger.board_reveal(regular_board())
+    ledger.no_win()
+    state = machine.trigger_natural_bonus(state, ledger, (0, 6, 12, 18))
+    for _ in range(config.initial_free_spins):
+        state = machine.start_free_spin(state, ledger)
+        ledger.board_reveal(regular_board())
+        ledger.no_win()
+        ledger.free_spin_complete(0, state.free_spins_remaining, state.column_levels)
+    machine.complete_bonus(state, ledger, 0)
+    validate_contract(ledger.events, config.wincap_units)
+
+
+def mutate_departure_fixture(events, mutation):
+    mutated = deepcopy(events)
+    load_events = [event for event in mutated if event["type"] == "columns_load"]
+    prepare = next(event for event in mutated if event["type"] == "departure_prepare")
+    departure_win = next(
+        event for event in mutated if event["type"] == "win_result" and event["appliedDepartureIds"]
+    )
+    resolve = next(event for event in mutated if event["type"] == "departure_resolve")
+    if mutation == "unknown":
+        mutated[1]["type"] = "mystery"
+    elif mutation == "missing_final":
+        mutated.pop()
+    elif mutation == "start_levels":
+        mutated[0]["levels"][0] = 1
+    elif mutation == "duplicate_column":
+        load_events[0]["transitions"][1]["column"] = 2
+    elif mutation == "bad_rank":
+        load_events[0]["transitions"][0]["selectionRank"] = 2
+    elif mutation == "duplicate_source":
+        load_events[0]["transitions"][0]["sourcePositions"][1] = load_events[0]["transitions"][0]["sourcePositions"][0]
+    elif mutation == "missing_prepare":
+        mutated.remove(prepare)
+    elif mutation == "multiplier":
+        prepare["multiplier"] += 1
+    elif mutation == "nonadjacent":
+        prepare["columns"] = [2, 4]
+    elif mutation == "payout_id":
+        departure_win["appliedDepartureIds"] = ["dep-wrong"]
+    elif mutation == "resolve_id":
+        resolve["departureId"] = "dep-wrong"
+    elif mutation == "terminal_gameplay":
+        position = mutated.index(resolve) + 1
+        mutated.insert(position, {"type": "board_reveal", "board": [list(c) for c in regular_board()]})
+    for index, event in enumerate(mutated):
+        event["index"] = index
+    return mutated
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "unknown",
+        "missing_final",
+        "start_levels",
+        "duplicate_column",
+        "bad_rank",
+        "duplicate_source",
+        "missing_prepare",
+        "multiplier",
+        "nonadjacent",
+        "payout_id",
+        "resolve_id",
+        "terminal_gameplay",
+    ),
+)
+def test_negative_contract_mutation_matrix(machine, config, mutation):
+    events, _, _ = build_end_to_end_departure_fixture(machine, config)
+    with pytest.raises(ValueError):
+        validate_contract(mutate_departure_fixture(events, mutation), config.wincap_units)

@@ -12,6 +12,7 @@ else
 endif
 
 makeVirtual:
+	$(PYTHON) -c "import sys; assert sys.version_info[:3] == (3, 12, 11), sys.version"
 	$(PYTHON) -m venv $(VENV_DIR)
 
 pipPackages: makeVirtual
@@ -19,10 +20,11 @@ pipPackages: makeVirtual
 
 buildPackage: pipPackages
 	mkdir -p $(WHEEL_DIR)
-	$(VENV_PY) -m pip wheel --no-deps --no-build-isolation --wheel-dir $(WHEEL_DIR) .
+	$(VENV_PY) -c "from pathlib import Path; [p.unlink() for p in Path('$(WHEEL_DIR)').glob('stakeengine-*.whl')]"
+	$(VENV_PY) -m pip wheel --no-cache-dir --no-deps --no-build-isolation --wheel-dir $(WHEEL_DIR) .
 
 packInstall: buildPackage
-	$(VENV_PY) -m pip install --no-index --find-links $(WHEEL_DIR) stakeengine==0.0.0
+	$(VENV_PY) -m pip install --force-reinstall --no-index --find-links $(WHEEL_DIR) stakeengine==0.0.0
 
 setup: packInstall
 	@echo "Virtual environment ready."
@@ -41,8 +43,10 @@ run GAME:
 	fi
 
 test:
-	cd $(CURDIR)
-	pytest tests/
+	$(VENV_PY) -m pytest tests/
+
+smokeInstalled:
+	cd /private/tmp && $(abspath $(VENV_PY)) -c "import games.last_shift.game_config as m; assert 'site-packages' in m.__file__; print(m.__file__)"
 
 test_run:
 	@for f in $(TEST_NAMES); do \

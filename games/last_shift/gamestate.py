@@ -23,6 +23,17 @@ def stage_for_departures(departures: int) -> str:
     return "yard"
 
 
+def validate_trigger_positions(positions: Sequence[int]) -> tuple[int, ...]:
+    normalized = tuple(positions)
+    if len(normalized) < 4:
+        raise ValueError("bonus trigger requires at least four positions")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("bonus trigger positions must be unique")
+    if any(not isinstance(position, int) or position < 0 or position >= 30 for position in normalized):
+        raise ValueError("bonus trigger position is outside the board")
+    return normalized
+
+
 @dataclass(frozen=True)
 class RoundState:
     mode: str = "basegame"
@@ -81,7 +92,18 @@ class LastShiftStateMachine:
     def new_base_round(self) -> tuple[RoundState, EventLedger]:
         self.active_outcome_path = "natural"
         state = RoundState()
-        return state, EventLedger(self.config.wincap_units)
+        ledger = EventLedger(
+            self.config.wincap_units,
+            payout_quantum_units=self.config.payout_quantum_units,
+        )
+        ledger.round_start(
+            mode=state.mode,
+            levels=state.column_levels,
+            departures=state.departures,
+            stage=state.stage,
+            free_spins_remaining=state.free_spins_remaining,
+        )
+        return state, ledger
 
     def trigger_natural_bonus(
         self,
@@ -91,8 +113,7 @@ class LastShiftStateMachine:
     ) -> RoundState:
         if state.mode != self.config.basegame_type:
             raise ValueError("natural bonus can only trigger from basegame")
-        if len(scatter_positions) < 4:
-            raise ValueError("natural bonus requires at least four scatters")
+        positions = validate_trigger_positions(scatter_positions)
         bonus_state = RoundState(
             mode=self.config.freegame_type,
             column_levels=state.column_levels,
@@ -103,7 +124,7 @@ class LastShiftStateMachine:
             capped=ledger.capped,
         )
         ledger.bonus_trigger(
-            scatter_positions,
+            positions,
             self.config.initial_free_spins,
             bonus_state.column_levels,
             outcome_path="natural",
@@ -120,8 +141,7 @@ class LastShiftStateMachine:
     ) -> RoundState:
         if criterion not in self.config.outcome_paths["forced"]:
             raise ValueError("forced outcome requires a dedicated forced criterion")
-        if len(scatter_positions) < 4:
-            raise ValueError("forced bonus fixture still requires a valid trigger board")
+        positions = validate_trigger_positions(scatter_positions)
         bonus_state = RoundState(
             mode=self.config.freegame_type,
             column_levels=state.column_levels,
@@ -132,7 +152,7 @@ class LastShiftStateMachine:
             capped=ledger.capped,
         )
         ledger.bonus_trigger(
-            scatter_positions,
+            positions,
             self.config.initial_free_spins,
             bonus_state.column_levels,
             outcome_path="forced",
@@ -166,8 +186,7 @@ class LastShiftStateMachine:
     ) -> RoundState:
         if state.mode != self.config.freegame_type:
             raise ValueError("retrigger can only occur in freegame")
-        if len(scatter_positions) < 4:
-            raise ValueError("retrigger requires at least four scatters")
+        positions = validate_trigger_positions(scatter_positions)
         next_state = replace(
             state,
             free_spins_remaining=(
@@ -175,9 +194,12 @@ class LastShiftStateMachine:
             ),
         )
         ledger.retrigger(
-            scatter_positions,
+            positions,
             self.config.retrigger_free_spins,
             next_state.free_spins_remaining,
+            next_state.column_levels,
+            next_state.stage,
+            next_state.departures,
         )
         return next_state
 
@@ -190,10 +212,17 @@ class LastShiftStateMachine:
         levels = list(state.column_levels)
         departures = state.departures
         for group in groups:
+            expected_stage = (
+                "yard"
+                if state.mode == self.config.basegame_type
+                else stage_for_departures(departures)
+            )
+            if group.stage_at_selection != expected_stage:
+                raise ValueError("departure stageAtSelection does not match state")
             reset_level = 0 if state.mode == self.config.basegame_type else RESET_LEVELS[group.stage_at_selection]
             for column in group.columns:
                 levels[column] = reset_level
-            departures += 1
+            departures += len(group.columns)
             stage_after = (
                 "yard"
                 if state.mode == self.config.basegame_type

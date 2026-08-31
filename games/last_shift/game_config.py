@@ -35,6 +35,7 @@ class GameConfig(Config):
         self.special_symbols = {"wild": ["W"], "scatter": ["S"]}
 
         self.payout_scale = 100
+        self.payout_quantum_units = 10
         self.wincap = 20_000
         self.wincap_units = self.wincap * self.payout_scale
         self.minimum_scatter_pay_count = 8
@@ -81,7 +82,14 @@ class GameConfig(Config):
             "H": 280,
         }
         self.paytable_units = {
-            (count, symbol): (count_pay * symbol_value) // self.payout_scale
+            (count, symbol): max(
+                self.payout_quantum_units,
+                (
+                    (count_pay * symbol_value + self.payout_scale * 5)
+                    // (self.payout_scale * 10)
+                )
+                * self.payout_quantum_units,
+            )
             for count, count_pay in count_pays_units.items()
             for symbol, symbol_value in symbol_values_units.items()
         }

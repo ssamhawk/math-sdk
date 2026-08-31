@@ -123,6 +123,9 @@ def load_selected_columns(
         raise ValueError("stable column levels must be six values in range 0..2")
     if len(selections) > 2:
         raise ValueError("an evaluation cannot load more than two columns")
+    selected_columns = [selection.column for selection in selections]
+    if len(selected_columns) != len(set(selected_columns)):
+        raise ValueError("selected columns must be unique")
 
     next_levels = list(levels)
     transitions = []
@@ -187,6 +190,8 @@ def make_departure_groups(
     component_by_column: dict[int, int],
     departure_sequence: int,
 ) -> tuple[DepartureGroup, ...]:
+    if stage not in ("yard", "mainline", "redline"):
+        raise ValueError("unknown departure stage")
     groups = []
     for offset, columns in enumerate(group_completed_columns(completed_columns)):
         components = tuple(component_by_column[column] for column in columns)
