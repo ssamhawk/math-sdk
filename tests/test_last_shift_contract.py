@@ -998,6 +998,60 @@ def test_unresolved_departure_cannot_complete_without_cap(machine, config):
         machine.complete_round(state, ledger)
 
 
+def test_producer_rejects_round_start_to_round_complete(machine):
+    state, ledger = machine.new_base_round()
+    with pytest.raises(ValueError, match="resolved terminal path"):
+        machine.complete_round(state, ledger)
+    assert event_types(ledger.events) == ["round_start"]
+
+
+def test_producer_rejects_win_load_to_round_complete(machine, config):
+    state, ledger = machine.new_base_round()
+    board = all_wild_board()
+    ledger.board_reveal(board)
+    evaluated, payout = evaluate_pay_anywhere(board, config)
+    ledger.win_result(payout, groups=serialize_wins(evaluated))
+    ledger.symbols_remove(
+        sorted({position for win in evaluated for position in win.positions})
+    )
+    ledger.columns_load(())
+    with pytest.raises(ValueError, match="resolved terminal path"):
+        machine.complete_round(state, ledger)
+    assert event_types(ledger.events[-3:]) == [
+        "win_result",
+        "symbols_remove",
+        "columns_load",
+    ]
+
+
+def test_producer_rejects_win_load_to_free_spin_complete(machine, config):
+    state, ledger = machine.new_base_round()
+    state = enter_natural_bonus(machine, state, ledger, scatter_board())
+    state = machine.start_free_spin(state, ledger)
+    spin_start_payout = ledger.round_payout_units
+    board = all_wild_board()
+    ledger.board_reveal(board)
+    evaluated, payout = evaluate_pay_anywhere(board, config)
+    ledger.win_result(
+        payout, groups=serialize_wins(evaluated), contribution_bucket="bonus_plain"
+    )
+    ledger.symbols_remove(
+        sorted({position for win in evaluated for position in win.positions})
+    )
+    ledger.columns_load(())
+    with pytest.raises(ValueError, match="resolved terminal path"):
+        ledger.free_spin_complete(
+            ledger.round_payout_units - spin_start_payout,
+            state.free_spins_remaining,
+            state.column_levels,
+        )
+    assert event_types(ledger.events[-3:]) == [
+        "win_result",
+        "symbols_remove",
+        "columns_load",
+    ]
+
+
 def test_capped_departure_cancels_all_pending_and_uses_exact_terminal_tail(machine, config):
     state, ledger = machine.new_base_round()
     state, group = emit_three_level_departure(

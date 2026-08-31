@@ -91,6 +91,7 @@ class EventLedger:
         self.active_evaluation = False
         self.pending_modifier = False
         self.terminal_boundary = False
+        self.terminal_path_ready = False
         self.spin_triggered = False
         self.unresolved_departure_ids: set[str] = set()
         self.free_spins_remaining = 0
@@ -113,6 +114,7 @@ class EventLedger:
         self.current_board = normalized
         self.active_evaluation = True
         self.terminal_boundary = False
+        self.terminal_path_ready = False
         return self._append("board_reveal", board=[list(column) for column in normalized])
 
     def round_start(
@@ -142,6 +144,7 @@ class EventLedger:
         self.current_board = normalized
         self.active_evaluation = True
         self.terminal_boundary = False
+        self.terminal_path_ready = False
         return self._append(
             "cascade_refill", resultingBoard=deepcopy([list(column) for column in normalized])
         )
@@ -155,6 +158,7 @@ class EventLedger:
         self.current_board = tuple(tuple(column) for column in resulting_board)
         self.active_evaluation = True
         self.pending_modifier = True
+        self.terminal_path_ready = False
         return self._append(
             "board_modifier",
             reason=reason,
@@ -182,6 +186,7 @@ class EventLedger:
             raise ValueError(f"unknown contribution bucket: {contribution_bucket}")
         if len(applied_departure_ids) != len(set(applied_departure_ids)):
             raise ValueError("applied departure IDs must be unique")
+        self.terminal_path_ready = False
         self._finish_evaluation()
         if self.unresolved_departure_ids and set(applied_departure_ids) != self.unresolved_departure_ids:
             raise ValueError("applied departure IDs must equal the unresolved departure set")
@@ -219,6 +224,7 @@ class EventLedger:
         if self.unresolved_departure_ids:
             raise ValueError("departure evaluation cannot terminate with no_win")
         self.terminal_boundary = True
+        self.terminal_path_ready = self.scatter_latch is None
         return self._append("no_win", roundPayoutUnits=self.round_payout_units)
 
     def _finish_evaluation(self) -> None:
@@ -234,12 +240,15 @@ class EventLedger:
         self.active_evaluation = False
         self.pending_modifier = False
         self.terminal_boundary = False
+        self.terminal_path_ready = False
         self.unresolved_departure_ids.clear()
 
     def symbols_remove(self, positions: Iterable[int]) -> dict[str, Any]:
+        self.terminal_path_ready = False
         return self._append("symbols_remove", positions=sorted(set(positions)))
 
     def columns_load(self, transitions: Sequence[LoadTransition]) -> dict[str, Any]:
+        self.terminal_path_ready = False
         return self._append(
             "columns_load",
             transitions=[
@@ -258,6 +267,7 @@ class EventLedger:
     def departure_prepare(self, group: DepartureGroup) -> dict[str, Any]:
         if group.departure_id in self.unresolved_departure_ids:
             raise ValueError("departureId must be unique")
+        self.terminal_path_ready = False
         self.unresolved_departure_ids.add(group.departure_id)
         return self._append(
             "departure_prepare",
@@ -284,6 +294,9 @@ class EventLedger:
             self.unresolved_departure_ids.remove(group.departure_id)
         if not self.unresolved_departure_ids:
             self.terminal_boundary = True
+            self.terminal_path_ready = self.scatter_latch is None
+        else:
+            self.terminal_path_ready = False
         return self._append(
             "departure_resolve",
             departureId=group.departure_id,
@@ -309,6 +322,7 @@ class EventLedger:
         self.mode = "freegame"
         self.free_spins_remaining = awarded_spins
         self.bonus_start_payout_units = self.round_payout_units
+        self.terminal_path_ready = False
         return self._append(
             "bonus_trigger",
             positions=valid_positions,
@@ -337,6 +351,7 @@ class EventLedger:
         self.scatter_latch = None
         self.spin_triggered = False
         self.terminal_boundary = False
+        self.terminal_path_ready = False
         self.spin_start_payout_units = self.round_payout_units
         return self._append(
             "free_spin_start",
@@ -365,6 +380,7 @@ class EventLedger:
             if free_spins_after != self.free_spins_remaining + added_spins:
                 raise ValueError("retrigger spin count does not reconcile")
             self.free_spins_remaining = free_spins_after
+            self.terminal_path_ready = True
         return self._append(
             "retrigger",
             positions=valid_positions,
@@ -390,6 +406,8 @@ class EventLedger:
                 raise ValueError("free spin has unresolved gameplay obligations")
             if self.scatter_latch is not None:
                 raise ValueError("latched scatter requires retrigger before completion")
+            if not self.terminal_path_ready:
+                raise ValueError("free_spin_complete requires a resolved terminal path")
             if self.spin_start_payout_units is None:
                 raise ValueError("free_spin_complete has no matching start")
             if payout_units != self.round_payout_units - self.spin_start_payout_units:
@@ -397,13 +415,15 @@ class EventLedger:
             if spins_remaining != self.free_spins_remaining:
                 raise ValueError("free-spin remaining count does not reconcile")
             self.spin_start_payout_units = None
-        return self._append(
+        event = self._append(
             "free_spin_complete",
             payoutUnits=payout_units,
             spinsRemaining=spins_remaining,
             levels=list(levels),
             roundPayoutUnits=self.round_payout_units,
         )
+        self.terminal_path_ready = False
+        return event
 
     def bonus_complete(self, feature_payout_units: int) -> dict[str, Any]:
         if not isinstance(feature_payout_units, int) or feature_payout_units < 0 or (
@@ -449,6 +469,8 @@ class EventLedger:
                 raise ValueError("round_complete has unresolved gameplay obligations")
             if self.scatter_latch is not None:
                 raise ValueError("latched scatter requires a trigger before completion")
+            if self.mode == "basegame" and not self.terminal_path_ready:
+                raise ValueError("base round_complete requires a resolved terminal path")
             if self.mode == "freegame" and (
                 not self.events or self.events[-1].get("type") != "bonus_complete"
             ):
