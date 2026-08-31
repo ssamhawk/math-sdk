@@ -14,6 +14,7 @@ from games.last_shift.game_calculations import (
     WinningGroup,
     apply_departure_modifier,
     apply_level_modifier,
+    derive_scatter_positions,
     derive_contribution_bucket,
     evaluate_pay_anywhere,
     group_completed_columns,
@@ -84,6 +85,17 @@ class EventLedger:
         self.contribution_units = {bucket: 0 for bucket in CONTRIBUTION_BUCKETS}
         self.prior_payout_units = starting_payout_units
         self.events: list[dict[str, Any]] = []
+        self.mode: str | None = None
+        self.current_board: tuple[tuple[str, ...], ...] | None = None
+        self.scatter_latch: tuple[int, ...] | None = None
+        self.active_evaluation = False
+        self.pending_modifier = False
+        self.terminal_boundary = False
+        self.spin_triggered = False
+        self.unresolved_departure_ids: set[str] = set()
+        self.free_spins_remaining = 0
+        self.spin_start_payout_units: int | None = None
+        self.bonus_start_payout_units: int | None = None
 
     def _append(
         self, event_type: str, *, allow_after_cap: bool = False, **payload: Any
@@ -97,7 +109,11 @@ class EventLedger:
         return event
 
     def board_reveal(self, board: Sequence[Sequence[str]]) -> dict[str, Any]:
-        return self._append("board_reveal", board=[list(column) for column in board])
+        normalized = tuple(tuple(column) for column in board)
+        self.current_board = normalized
+        self.active_evaluation = True
+        self.terminal_boundary = False
+        return self._append("board_reveal", board=[list(column) for column in normalized])
 
     def round_start(
         self,
@@ -109,6 +125,8 @@ class EventLedger:
     ) -> dict[str, Any]:
         if self.events:
             raise ValueError("round_start must be the first event")
+        self.mode = mode
+        self.free_spins_remaining = free_spins_remaining
         return self._append(
             "round_start",
             mode=mode,
@@ -120,8 +138,12 @@ class EventLedger:
         )
 
     def cascade_refill(self, board: Sequence[Sequence[str]]) -> dict[str, Any]:
+        normalized = tuple(tuple(column) for column in board)
+        self.current_board = normalized
+        self.active_evaluation = True
+        self.terminal_boundary = False
         return self._append(
-            "cascade_refill", resultingBoard=deepcopy([list(column) for column in board])
+            "cascade_refill", resultingBoard=deepcopy([list(column) for column in normalized])
         )
 
     def board_modifier(
@@ -130,6 +152,9 @@ class EventLedger:
         changes: Sequence[SymbolChange],
         resulting_board: Sequence[Sequence[str]],
     ) -> dict[str, Any]:
+        self.current_board = tuple(tuple(column) for column in resulting_board)
+        self.active_evaluation = True
+        self.pending_modifier = True
         return self._append(
             "board_modifier",
             reason=reason,
@@ -155,6 +180,13 @@ class EventLedger:
             raise ValueError("payout violates the SDK payout quantum")
         if contribution_bucket not in CONTRIBUTION_BUCKETS:
             raise ValueError(f"unknown contribution bucket: {contribution_bucket}")
+        if len(applied_departure_ids) != len(set(applied_departure_ids)):
+            raise ValueError("applied departure IDs must be unique")
+        self._finish_evaluation()
+        if self.unresolved_departure_ids and set(applied_departure_ids) != self.unresolved_departure_ids:
+            raise ValueError("applied departure IDs must equal the unresolved departure set")
+        if not self.unresolved_departure_ids and applied_departure_ids:
+            raise ValueError("normal payout cannot reference a departure")
         payout_before = self.round_payout_units
         available = self.max_win_units - self.round_payout_units
         applied = min(requested_step_payout_units, available)
@@ -172,13 +204,37 @@ class EventLedger:
         )
         if self.round_payout_units == self.max_win_units:
             self.capped = True
+            self._cancel_pending_obligations()
             self._append(
                 "max_win", allow_after_cap=True, amountUnits=self.max_win_units
             )
         return event
 
     def no_win(self) -> dict[str, Any]:
+        if self.current_board is not None:
+            wins, payout = evaluate_pay_anywhere(self.current_board, GameConfig())
+            if wins or payout:
+                raise ValueError("no_win requires a zero-payout authoritative board")
+        self._finish_evaluation()
+        if self.unresolved_departure_ids:
+            raise ValueError("departure evaluation cannot terminate with no_win")
+        self.terminal_boundary = True
         return self._append("no_win", roundPayoutUnits=self.round_payout_units)
+
+    def _finish_evaluation(self) -> None:
+        if self.current_board is not None and self.scatter_latch is None:
+            positions = derive_scatter_positions(self.current_board, GameConfig())
+            if len(positions) >= 4:
+                self.scatter_latch = positions
+        self.active_evaluation = False
+        self.pending_modifier = False
+
+    def _cancel_pending_obligations(self) -> None:
+        self.scatter_latch = None
+        self.active_evaluation = False
+        self.pending_modifier = False
+        self.terminal_boundary = False
+        self.unresolved_departure_ids.clear()
 
     def symbols_remove(self, positions: Iterable[int]) -> dict[str, Any]:
         return self._append("symbols_remove", positions=sorted(set(positions)))
@@ -200,6 +256,9 @@ class EventLedger:
         )
 
     def departure_prepare(self, group: DepartureGroup) -> dict[str, Any]:
+        if group.departure_id in self.unresolved_departure_ids:
+            raise ValueError("departureId must be unique")
+        self.unresolved_departure_ids.add(group.departure_id)
         return self._append(
             "departure_prepare",
             departureId=group.departure_id,
@@ -217,6 +276,14 @@ class EventLedger:
         departures_after: int,
         stage_after: str,
     ) -> dict[str, Any]:
+        if self.closed or self.capped:
+            raise TerminalPayoutError("no gameplay event is allowed after max_win")
+        if self.unresolved_departure_ids:
+            if group.departure_id not in self.unresolved_departure_ids:
+                raise ValueError("departure_resolve has no matching prepare")
+            self.unresolved_departure_ids.remove(group.departure_id)
+        if not self.unresolved_departure_ids:
+            self.terminal_boundary = True
         return self._append(
             "departure_resolve",
             departureId=group.departure_id,
@@ -235,6 +302,13 @@ class EventLedger:
         board: Sequence[Sequence[str]] = (),
     ) -> dict[str, Any]:
         valid_positions = _validate_bonus_positions(positions, board)
+        if outcome_path == "natural" and self.mode is not None:
+            self._consume_scatter_latch(valid_positions, "bonus_trigger")
+            if self.mode != "basegame":
+                raise ValueError("bonus_trigger can only enter from basegame")
+        self.mode = "freegame"
+        self.free_spins_remaining = awarded_spins
+        self.bonus_start_payout_units = self.round_payout_units
         return self._append(
             "bonus_trigger",
             positions=valid_positions,
@@ -251,6 +325,19 @@ class EventLedger:
         stage: str,
         departures: int,
     ) -> dict[str, Any]:
+        if self.mode is not None:
+            if self.mode != "freegame" or self.free_spins_remaining <= 0:
+                raise ValueError("free_spin_start has no available bonus spin")
+            if self.spin_start_payout_units is not None:
+                raise ValueError("previous free spin is not complete")
+            self.free_spins_remaining -= 1
+            if spins_remaining != self.free_spins_remaining:
+                raise ValueError("free_spin_start spin count does not reconcile")
+        self.current_board = None
+        self.scatter_latch = None
+        self.spin_triggered = False
+        self.terminal_boundary = False
+        self.spin_start_payout_units = self.round_payout_units
         return self._append(
             "free_spin_start",
             spinIndex=spin_index,
@@ -271,6 +358,13 @@ class EventLedger:
         board: Sequence[Sequence[str]],
     ) -> dict[str, Any]:
         valid_positions = _validate_bonus_positions(positions, board)
+        if self.mode is not None:
+            if self.mode != "freegame":
+                raise ValueError("retrigger requires freegame state")
+            self._consume_scatter_latch(valid_positions, "retrigger")
+            if free_spins_after != self.free_spins_remaining + added_spins:
+                raise ValueError("retrigger spin count does not reconcile")
+            self.free_spins_remaining = free_spins_after
         return self._append(
             "retrigger",
             positions=valid_positions,
@@ -285,10 +379,24 @@ class EventLedger:
     def free_spin_complete(
         self, payout_units: int, spins_remaining: int, levels: Sequence[int]
     ) -> dict[str, Any]:
+        if self.closed or self.capped:
+            raise TerminalPayoutError("no gameplay event is allowed after max_win")
         if not isinstance(payout_units, int) or payout_units < 0 or (
             payout_units and payout_units % self.payout_quantum_units
         ):
             raise ValueError("free-spin payout violates the SDK payout quantum")
+        if self.mode is not None:
+            if self.active_evaluation or self.pending_modifier or self.unresolved_departure_ids:
+                raise ValueError("free spin has unresolved gameplay obligations")
+            if self.scatter_latch is not None:
+                raise ValueError("latched scatter requires retrigger before completion")
+            if self.spin_start_payout_units is None:
+                raise ValueError("free_spin_complete has no matching start")
+            if payout_units != self.round_payout_units - self.spin_start_payout_units:
+                raise ValueError("free-spin payout must be ledger-derived")
+            if spins_remaining != self.free_spins_remaining:
+                raise ValueError("free-spin remaining count does not reconcile")
+            self.spin_start_payout_units = None
         return self._append(
             "free_spin_complete",
             payoutUnits=payout_units,
@@ -302,6 +410,17 @@ class EventLedger:
             feature_payout_units and feature_payout_units % self.payout_quantum_units
         ):
             raise ValueError("bonus payout violates the SDK payout quantum")
+        if self.mode is not None:
+            if self.mode != "freegame" or self.free_spins_remaining != 0:
+                raise ValueError("bonus_complete requires zero remaining spins")
+            if self.active_evaluation or self.pending_modifier or self.unresolved_departure_ids:
+                raise ValueError("bonus_complete has unresolved gameplay obligations")
+            if self.spin_start_payout_units is not None or self.scatter_latch is not None:
+                raise ValueError("bonus_complete cannot bypass an active spin obligation")
+            if self.bonus_start_payout_units is None:
+                raise ValueError("bonus_complete has no natural bonus start")
+            if feature_payout_units != self.feature_payout_units:
+                raise ValueError("bonus payout must be ledger-derived")
         return self._append(
             "bonus_complete",
             featurePayoutUnits=feature_payout_units,
@@ -316,6 +435,24 @@ class EventLedger:
         final_departures: int = 0,
         final_free_spins_remaining: int = 0,
     ) -> dict[str, Any]:
+        if self.capped:
+            if len(self.events) < 2 or [event["type"] for event in self.events[-2:]] != [
+                "win_result",
+                "max_win",
+            ]:
+                raise TerminalPayoutError("capped completion requires win_result -> max_win")
+            win = self.events[-2]
+            if win.get("roundPayoutAfterUnits") != self.max_win_units:
+                raise TerminalPayoutError("capped win_result does not reconcile")
+        else:
+            if self.active_evaluation or self.pending_modifier or self.unresolved_departure_ids:
+                raise ValueError("round_complete has unresolved gameplay obligations")
+            if self.scatter_latch is not None:
+                raise ValueError("latched scatter requires a trigger before completion")
+            if self.mode == "freegame" and (
+                not self.events or self.events[-1].get("type") != "bonus_complete"
+            ):
+                raise ValueError("freegame must emit bonus_complete before round_complete")
         event = self._append(
             "round_complete",
             allow_after_cap=True,
@@ -331,6 +468,23 @@ class EventLedger:
         )
         self.closed = True
         return event
+
+    @property
+    def feature_payout_units(self) -> int:
+        if self.bonus_start_payout_units is None:
+            raise ValueError("feature payout has no bonus start")
+        return self.round_payout_units - self.bonus_start_payout_units
+
+    def _consume_scatter_latch(self, positions: Sequence[int], event_type: str) -> None:
+        if self.spin_triggered:
+            raise ValueError(f"a second {event_type} is not allowed in one spin")
+        if not self.terminal_boundary or self.scatter_latch is None:
+            raise ValueError(f"{event_type} requires a latched terminal scatter outcome")
+        if tuple(positions) != self.scatter_latch:
+            raise ValueError(f"{event_type} positions must equal the first scatter latch")
+        self.scatter_latch = None
+        self.terminal_boundary = False
+        self.spin_triggered = True
 
 
 def event_types(events: Sequence[dict[str, Any]]) -> list[str]:
@@ -429,6 +583,7 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
     bonus_start_payout: int | None = None
     saw_max_win = False
     last_modifier_reason: str | None = None
+    scatter_latch: tuple[int, ...] | None = None
 
     for index, event in enumerate(events):
         if event.get("index") != index:
@@ -569,6 +724,11 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             evaluated_wins, evaluated_payout = evaluate_pay_anywhere(
                 tuple(tuple(column) for column in current_board), config, active_departures
             )
+            evaluated_scatters = derive_scatter_positions(
+                tuple(tuple(column) for column in current_board), config
+            )
+            if scatter_latch is None and len(evaluated_scatters) >= 4:
+                scatter_latch = evaluated_scatters
             if event.get("groups") != serialize_wins(evaluated_wins):
                 raise ValueError("win_result groups do not reconcile to board evaluator")
             if requested != evaluated_payout:
@@ -598,15 +758,27 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
                 expected = {"symbols_remove"}
 
         elif event_type == "no_win":
+            if current_board is None:
+                raise ValueError("no_win has no authoritative board")
+            evaluated_wins, evaluated_payout = evaluate_pay_anywhere(
+                tuple(tuple(column) for column in current_board), config
+            )
+            if evaluated_wins or evaluated_payout:
+                raise ValueError("no_win requires a zero-payout authoritative board")
+            evaluated_scatters = derive_scatter_positions(
+                tuple(tuple(column) for column in current_board), config
+            )
+            if scatter_latch is None and len(evaluated_scatters) >= 4:
+                scatter_latch = evaluated_scatters
             if event.get("roundPayoutUnits") != payout_after:
                 raise ValueError("no_win payout does not reconcile")
             if departure_evaluation:
                 raise ValueError("departure evaluation cannot continue after no_win")
-            expected = (
-                {"bonus_trigger", "round_complete"}
-                if mode == "basegame"
-                else {"retrigger", "free_spin_complete"}
-            )
+            last_modifier_reason = None
+            if scatter_latch is not None:
+                expected = {"bonus_trigger"} if mode == "basegame" else {"retrigger"}
+            else:
+                expected = {"round_complete"} if mode == "basegame" else {"free_spin_complete"}
 
         elif event_type == "symbols_remove":
             positions = set(check_positions(event.get("positions"), "symbols_remove positions", 1))
@@ -759,20 +931,24 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
                 expected = {"departure_resolve"}
             else:
                 departure_evaluation = False
-                expected = {"free_spin_complete"} if mode == "freegame" else {"round_complete"}
+                if scatter_latch is not None:
+                    expected = {"retrigger"} if mode == "freegame" else {"bonus_trigger"}
+                else:
+                    expected = {"free_spin_complete"} if mode == "freegame" else {"round_complete"}
 
         elif event_type == "bonus_trigger":
             if mode != "basegame":
                 raise ValueError("bonus_trigger can only enter from basegame")
-            check_positions(event.get("positions"), "bonus trigger positions", 4)
-            if any(current_board[position % 6][position // 6] != "S" for position in event["positions"]):
-                raise ValueError("bonus trigger position does not point to S")
+            positions = tuple(check_positions(event.get("positions"), "bonus trigger positions", 4))
+            if scatter_latch is None or positions != scatter_latch:
+                raise ValueError("bonus_trigger must use the first complete scatter latch")
             if event.get("awardedSpins") != 10:
                 raise ValueError("natural bonus must award ten spins")
             if event.get("startingLevels") != levels:
                 raise ValueError("bonus starting levels do not match base state")
-            if event.get("outcomePath") not in ("natural", "forced"):
-                raise ValueError("bonus outcome path is invalid")
+            if event.get("outcomePath") != "natural":
+                raise ValueError("release contract rejects forced outcomePath")
+            scatter_latch = None
             mode = "freegame"
             departures = 0
             stage = "yard"
@@ -794,14 +970,16 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             ):
                 raise ValueError("free_spin_start state does not reconcile")
             spin_start_payout = payout_after
+            scatter_latch = None
+            last_modifier_reason = None
             expected = {"board_reveal"}
 
         elif event_type == "retrigger":
             if mode != "freegame":
                 raise ValueError("retrigger requires freegame state")
-            check_positions(event.get("positions"), "retrigger positions", 4)
-            if any(current_board[position % 6][position // 6] != "S" for position in event["positions"]):
-                raise ValueError("retrigger position does not point to S")
+            positions = tuple(check_positions(event.get("positions"), "retrigger positions", 4))
+            if scatter_latch is None or positions != scatter_latch:
+                raise ValueError("retrigger must use the first complete scatter latch")
             if event.get("addedSpins") != 4 or event.get("freeSpinsAfter") != free_spins + 4:
                 raise ValueError("retrigger spin counters do not reconcile")
             if (
@@ -812,6 +990,7 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             ):
                 raise ValueError("retrigger changed persistent bonus state")
             free_spins += 4
+            scatter_latch = None
             expected = {"free_spin_complete"}
 
         elif event_type == "free_spin_complete":
@@ -830,6 +1009,8 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
         elif event_type == "bonus_complete":
             if mode != "freegame" or free_spins != 0 or bonus_start_payout is None:
                 raise ValueError("bonus_complete has invalid feature state")
+            if spin_start_payout is not None or unresolved_departures or last_modifier_reason:
+                raise ValueError("bonus_complete has unresolved gameplay obligations")
             if (
                 event.get("featurePayoutUnits") != payout_after - bonus_start_payout
                 or event.get("roundPayoutUnits") != payout_after
@@ -841,6 +1022,16 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             if event.get("amountUnits") != max_win_units or payout_after != max_win_units:
                 raise ValueError("max_win does not reconcile to cap")
             saw_max_win = True
+            scatter_latch = None
+            last_modifier_reason = None
+            scheduled_modifiers = {}
+            scheduled_transitions = []
+            full_columns.clear()
+            completed_columns_for_evaluation.clear()
+            unresolved_departures.clear()
+            current_prepare_ids = []
+            departure_evaluation = False
+            spin_start_payout = None
             expected = {"round_complete"}
 
         elif event_type == "round_complete":
@@ -863,10 +1054,18 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
                 raise ValueError("round_complete capped flag does not match max_win")
             if saw_max_win and events[index - 1].get("type") != "max_win":
                 raise ValueError("max_win must immediately precede capped final")
-            if full_columns or unresolved_departures or any(
-                not group["resolved"] for group in prepared.values()
+            if not saw_max_win and (
+                full_columns
+                or unresolved_departures
+                or any(not group["resolved"] for group in prepared.values())
             ):
                 raise ValueError("departure lifecycle is incomplete at round_complete")
+            if saw_max_win and (
+                index < 2
+                or events[index - 2].get("type") != "win_result"
+                or events[index - 2].get("roundPayoutAfterUnits") != max_win_units
+            ):
+                raise ValueError("capped final requires reconciled win_result -> max_win")
             expected = set()
 
     if expected:

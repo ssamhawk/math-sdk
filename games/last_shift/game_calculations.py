@@ -99,6 +99,17 @@ def symbol_at(board: Board, position: int) -> str:
     return board[column][row]
 
 
+def derive_scatter_positions(board: Board, config: GameConfig) -> tuple[int, ...]:
+    """Return the complete sorted scatter set from an authoritative board."""
+    validate_board(board, config)
+    return tuple(
+        flat_position(column, row, config.num_reels)
+        for row in range(config.num_rows[0])
+        for column in range(config.num_reels)
+        if board[column][row] == "S"
+    )
+
+
 def evaluate_pay_anywhere(
     board: Board, config: GameConfig, departures: Sequence[DepartureGroup] = ()
 ) -> tuple[tuple[EvaluatedWin, ...], int]:

@@ -6,7 +6,12 @@ from dataclasses import dataclass, replace
 import random
 from typing import Sequence
 
-from games.last_shift.game_calculations import Board, DepartureGroup, symbol_at, validate_board
+from games.last_shift.game_calculations import (
+    Board,
+    DepartureGroup,
+    derive_scatter_positions,
+    validate_board,
+)
 from games.last_shift.game_config import GameConfig
 from games.last_shift.game_events import EventLedger
 
@@ -34,8 +39,9 @@ def validate_trigger_positions(
         raise ValueError("bonus trigger positions must be unique")
     if any(not isinstance(position, int) or position < 0 or position >= 30 for position in normalized):
         raise ValueError("bonus trigger position is outside the board")
-    if any(symbol_at(board, position) != "S" for position in normalized):
-        raise ValueError("bonus trigger position must point to S")
+    authoritative = derive_scatter_positions(board, config)
+    if tuple(sorted(normalized)) != authoritative:
+        raise ValueError("bonus trigger positions must point to S and equal the complete sorted scatter set")
     return normalized
 
 
@@ -259,6 +265,8 @@ class LastShiftStateMachine:
         )
 
     def complete_round(self, state: RoundState, ledger: EventLedger) -> RoundState:
+        if state.capped != ledger.capped:
+            raise ValueError("state and ledger cap status do not match")
         final_levels = (0, 0, 0, 0, 0, 0)
         ledger.round_complete(final_levels)
         self.active_outcome_path = "natural"
@@ -274,6 +282,13 @@ class LastShiftStateMachine:
     ) -> RoundState:
         if state.mode != self.config.freegame_type:
             raise ValueError("bonus completion requires freegame state")
-        if not ledger.capped:
-            ledger.bonus_complete(feature_payout_units)
+        if state.capped != ledger.capped:
+            raise ValueError("state and ledger cap status do not match")
+        if ledger.capped:
+            return self.complete_round(state, ledger)
+        if state.free_spins_remaining != 0:
+            raise ValueError("bonus completion requires zero remaining spins")
+        if feature_payout_units != ledger.feature_payout_units:
+            raise ValueError("bonus payout must be ledger-derived")
+        ledger.bonus_complete(ledger.feature_payout_units)
         return self.complete_round(state, ledger)
