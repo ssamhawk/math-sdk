@@ -7,10 +7,21 @@ from dataclasses import asdict
 from typing import Any, Iterable, Sequence
 
 from games.last_shift.game_calculations import (
+    ALLOWED_COMPONENTS,
     DepartureGroup,
     LoadTransition,
     SymbolChange,
+    WinningGroup,
+    apply_departure_modifier,
+    apply_level_modifier,
+    derive_contribution_bucket,
+    evaluate_pay_anywhere,
+    group_completed_columns,
+    modifier_reason_for,
+    select_cargo_columns,
+    serialize_wins,
 )
+from games.last_shift.game_config import GameConfig
 
 
 class TerminalPayoutError(RuntimeError):
@@ -22,13 +33,17 @@ CONTRIBUTION_BUCKETS = (
     "base_modifier",
     "base_single_departure",
     "base_coupled_departure",
-    "bonus_yard",
-    "bonus_mainline",
-    "bonus_redline",
+    "bonus_plain",
+    "bonus_modifier",
+    "bonus_yard_departure",
+    "bonus_mainline_departure",
+    "bonus_redline_departure",
 )
 
 
-def _validate_bonus_positions(positions: Sequence[int]) -> list[int]:
+def _validate_bonus_positions(
+    positions: Sequence[int], board: Sequence[Sequence[str]]
+) -> list[int]:
     normalized = list(positions)
     if len(normalized) < 4:
         raise ValueError("bonus positions require at least four entries")
@@ -36,6 +51,8 @@ def _validate_bonus_positions(positions: Sequence[int]) -> list[int]:
         raise ValueError("bonus positions must be unique")
     if any(not isinstance(position, int) or position < 0 or position >= 30 for position in normalized):
         raise ValueError("bonus position is outside the board")
+    if any(board[position % 6][position // 6] != "S" for position in normalized):
+        raise ValueError("bonus position must point to S")
     return normalized
 
 
@@ -215,8 +232,9 @@ class EventLedger:
         awarded_spins: int,
         levels: Sequence[int],
         outcome_path: str = "natural",
+        board: Sequence[Sequence[str]] = (),
     ) -> dict[str, Any]:
-        valid_positions = _validate_bonus_positions(positions)
+        valid_positions = _validate_bonus_positions(positions, board)
         return self._append(
             "bonus_trigger",
             positions=valid_positions,
@@ -250,8 +268,9 @@ class EventLedger:
         levels: Sequence[int],
         stage: str,
         departures: int,
+        board: Sequence[Sequence[str]],
     ) -> dict[str, Any]:
-        valid_positions = _validate_bonus_positions(positions)
+        valid_positions = _validate_bonus_positions(positions, board)
         return self._append(
             "retrigger",
             positions=valid_positions,
@@ -344,6 +363,7 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
     stages = ("yard", "mainline", "redline")
     reset_levels = {"yard": 0, "mainline": 1, "redline": 2}
     payout_quantum = 10
+    config = GameConfig()
 
     def stage_for(departures: int) -> str:
         if departures >= 4:
@@ -398,13 +418,17 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
     regular_win_positions: set[int] = set()
     winning_positions: set[int] = set()
     scheduled_modifiers: dict[int, int] = {}
+    scheduled_transitions: list[LoadTransition] = []
     full_columns: set[int] = set()
+    completed_columns_for_evaluation: set[int] = set()
+    current_prepare_ids: list[str] = []
     prepared: dict[str, dict[str, Any]] = {}
     unresolved_departures: set[str] = set()
     departure_evaluation = False
     spin_start_payout: int | None = None
     bonus_start_payout: int | None = None
     saw_max_win = False
+    last_modifier_reason: str | None = None
 
     for index, event in enumerate(events):
         if event.get("index") != index:
@@ -434,6 +458,14 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
         elif event_type == "cascade_refill":
             if full_columns:
                 raise ValueError("full transitions are missing departure_prepare")
+            if completed_columns_for_evaluation:
+                expected_partition = group_completed_columns(completed_columns_for_evaluation)
+                actual_partition = tuple(
+                    tuple(prepared[departure_id]["columns"])
+                    for departure_id in current_prepare_ids
+                )
+                if actual_partition != expected_partition:
+                    raise ValueError("simultaneous full columns use invalid departure grouping")
             current_board = check_board(
                 event.get("resultingBoard"), "cascade_refill.resultingBoard"
             )
@@ -444,7 +476,7 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
                 expected = {"board_modifier", "win_result", "no_win"}
 
         elif event_type == "board_modifier":
-            current_board = check_board(
+            supplied_board = check_board(
                 event.get("resultingBoard"), "board_modifier.resultingBoard"
             )
             changes = event.get("changes")
@@ -453,30 +485,42 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             if departure_evaluation:
                 if event.get("reason") != "departure":
                     raise ValueError("departure evaluation requires departure modifier")
-                departing_columns = {
-                    column
-                    for departure_id in unresolved_departures
-                    for column in prepared[departure_id]["columns"]
-                }
-                changed_positions = {change.get("position") for change in changes}
-                required_positions = {
-                    row * 6 + column for column in departing_columns for row in range(5)
-                }
-                if changed_positions != required_positions:
-                    raise ValueError("departure modifier must cover every departing position")
-                if any(current_board[column] != ["W"] * 5 for column in departing_columns):
-                    raise ValueError("departure resulting board must contain full wild columns")
+                groups = [
+                    DepartureGroup(
+                        departure_id,
+                        prepared[departure_id]["kind"],
+                        tuple(prepared[departure_id]["columns"]),
+                        tuple(prepared[departure_id]["components"]),
+                        prepared[departure_id]["multiplier"],
+                        prepared[departure_id]["stage"],
+                    )
+                    for departure_id in current_prepare_ids
+                ]
+                expected_board, expected_changes = apply_departure_modifier(
+                    tuple(tuple(column) for column in current_board), groups, config
+                )
+                if event.get("reason") != "departure":
+                    raise ValueError("departure modifier reason is invalid")
             elif scheduled_modifiers:
-                counts: dict[int, int] = {}
-                for change in changes:
-                    column = change.get("column")
-                    position = change.get("position")
-                    if column not in scheduled_modifiers or not isinstance(position, int) or position % 6 != column:
-                        raise ValueError("load modifier change does not match scheduled column")
-                    counts[column] = counts.get(column, 0) + 1
-                if counts != scheduled_modifiers:
-                    raise ValueError("load modifier change count does not match entered level")
+                expected_board = tuple(tuple(column) for column in current_board)
+                expected_changes = []
+                for transition in scheduled_transitions:
+                    expected_board, transition_changes = apply_level_modifier(
+                        expected_board, transition, config
+                    )
+                    expected_changes.extend(transition_changes)
+                if event.get("reason") != modifier_reason_for(scheduled_transitions):
+                    raise ValueError("load modifier reason does not match transitions")
                 scheduled_modifiers = {}
+                scheduled_transitions = []
+            else:
+                raise ValueError("unscheduled board_modifier")
+            if changes != [asdict(change) for change in expected_changes]:
+                raise ValueError("board_modifier changes do not reconcile")
+            if supplied_board != [list(column) for column in expected_board]:
+                raise ValueError("board_modifier resultingBoard does not reconcile")
+            current_board = supplied_board
+            last_modifier_reason = event.get("reason")
             expected = {"win_result"} if departure_evaluation else {"win_result", "no_win"}
 
         elif event_type == "win_result":
@@ -503,25 +547,6 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             contribution_units[bucket] += applied
             payout_after = cumulative
 
-            groups = event.get("groups")
-            if not isinstance(groups, list) or not groups:
-                raise ValueError("win_result requires authoritative winning groups")
-            regular_win_positions = set()
-            winning_positions = set()
-            for group in groups:
-                symbol = group.get("symbol")
-                positions = check_positions(group.get("positions"), "winning group positions", 1)
-                if symbol not in regular_symbols:
-                    raise ValueError("winning group symbol must be regular")
-                for position in positions:
-                    column, row = position % 6, position // 6
-                    landed = current_board[column][row]
-                    if landed not in (symbol, "W"):
-                        raise ValueError("winning group position does not match board")
-                    if landed == symbol:
-                        regular_win_positions.add(position)
-                winning_positions.update(positions)
-
             applied_ids = event.get("appliedDepartureIds")
             if not isinstance(applied_ids, list) or len(applied_ids) != len(set(applied_ids)):
                 raise ValueError("applied departure IDs must be a unique list")
@@ -530,6 +555,40 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
                     raise ValueError("departure payout IDs do not match prepared departures")
             elif applied_ids:
                 raise ValueError("normal payout cannot reference a departure")
+            active_departures = [
+                DepartureGroup(
+                    departure_id,
+                    prepared[departure_id]["kind"],
+                    tuple(prepared[departure_id]["columns"]),
+                    tuple(prepared[departure_id]["components"]),
+                    prepared[departure_id]["multiplier"],
+                    prepared[departure_id]["stage"],
+                )
+                for departure_id in current_prepare_ids
+            ] if departure_evaluation else []
+            evaluated_wins, evaluated_payout = evaluate_pay_anywhere(
+                tuple(tuple(column) for column in current_board), config, active_departures
+            )
+            if event.get("groups") != serialize_wins(evaluated_wins):
+                raise ValueError("win_result groups do not reconcile to board evaluator")
+            if requested != evaluated_payout:
+                raise ValueError("win_result payout does not reconcile to board evaluator")
+            winning_groups = tuple(
+                WinningGroup(win.symbol, win.positions) for win in evaluated_wins
+            )
+            regular_win_positions = {
+                position
+                for win in evaluated_wins
+                for position in win.positions
+                if current_board[position % 6][position // 6] == win.symbol
+            }
+            winning_positions = {position for win in evaluated_wins for position in win.positions}
+            derived_bucket = derive_contribution_bucket(
+                mode, last_modifier_reason, active_departures
+            )
+            if bucket != derived_bucket:
+                raise ValueError("contribution bucket does not match mode/mechanic")
+            last_modifier_reason = None
 
             if payout_after == max_win_units:
                 expected = {"max_win"}
@@ -565,6 +624,7 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             source_union: set[int] = set()
             ranking = []
             scheduled_modifiers = {}
+            scheduled_transitions = []
             full_columns = set()
             for transition in transitions:
                 column = transition.get("column")
@@ -594,6 +654,9 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
                     levels[column] = after
                     scheduled_modifiers[column] = after
                 ranking.append((count, column, rank))
+                scheduled_transitions.append(
+                    LoadTransition(column, before, after, tuple(sources), count, rank)
+                )
             expected_ranking = [
                 (count, column, rank)
                 for rank, (count, column, _) in enumerate(
@@ -602,6 +665,30 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             ]
             if sorted(ranking, key=lambda value: value[2]) != expected_ranking:
                 raise ValueError("load selection rank does not match count/tie ordering")
+            expected_selections = select_cargo_columns(
+                tuple(tuple(column) for column in current_board), winning_groups, config
+            )
+            expected_transitions = [
+                {
+                    "column": selection.column,
+                    "levelBefore": transitions[index]["levelBefore"] if index < len(transitions) else None,
+                    "levelAfter": min(levels[selection.column] + 1, 3),
+                    "sourcePositions": list(selection.source_positions),
+                    "regularWinningCount": selection.regular_winning_count,
+                    "selectionRank": selection.selection_rank,
+                }
+                for index, selection in enumerate(expected_selections)
+            ]
+            if len(transitions) != len(expected_transitions) or any(
+                transition["column"] != expected.column
+                or transition["sourcePositions"] != list(expected.source_positions)
+                or transition["regularWinningCount"] != expected.regular_winning_count
+                or transition["selectionRank"] != expected.selection_rank
+                for transition, expected in zip(transitions, expected_selections)
+            ):
+                raise ValueError("columns_load is not the exact top-two cargo derivation")
+            completed_columns_for_evaluation = set(full_columns)
+            current_prepare_ids = []
             expected = {"departure_prepare"} if full_columns else {"cascade_refill"}
 
         elif event_type == "departure_prepare":
@@ -631,11 +718,18 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
                 raise ValueError("departure multiplier must equal component sum")
             if event.get("stageAtSelection") != stage:
                 raise ValueError("departure stageAtSelection does not match state")
+            allowed = ALLOWED_COMPONENTS.get((mode, stage), set())
+            if any(component not in allowed for component in components):
+                raise ValueError("departure component is not allowed for mode/stage")
             prepared[departure_id] = {
                 "columns": list(columns),
                 "stage": stage,
+                "kind": kind,
+                "components": list(components),
+                "multiplier": event.get("multiplier"),
                 "resolved": False,
             }
+            current_prepare_ids.append(departure_id)
             unresolved_departures.add(departure_id)
             full_columns.difference_update(columns)
             expected = {"departure_prepare"} if full_columns else {"cascade_refill"}
@@ -671,6 +765,8 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             if mode != "basegame":
                 raise ValueError("bonus_trigger can only enter from basegame")
             check_positions(event.get("positions"), "bonus trigger positions", 4)
+            if any(current_board[position % 6][position // 6] != "S" for position in event["positions"]):
+                raise ValueError("bonus trigger position does not point to S")
             if event.get("awardedSpins") != 10:
                 raise ValueError("natural bonus must award ten spins")
             if event.get("startingLevels") != levels:
@@ -704,6 +800,8 @@ def validate_contract(events: Sequence[dict[str, Any]], max_win_units: int) -> N
             if mode != "freegame":
                 raise ValueError("retrigger requires freegame state")
             check_positions(event.get("positions"), "retrigger positions", 4)
+            if any(current_board[position % 6][position // 6] != "S" for position in event["positions"]):
+                raise ValueError("retrigger position does not point to S")
             if event.get("addedSpins") != 4 or event.get("freeSpinsAfter") != free_spins + 4:
                 raise ValueError("retrigger spin counters do not reconcile")
             if (

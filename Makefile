@@ -2,6 +2,7 @@ PYTHON := python3
 VENV_DIR := env
 VENV_PY := $(VENV_DIR)/bin/python
 WHEEL_DIR := .build/wheels
+export SOURCE_DATE_EPOCH := $(shell git log -1 --pretty=%ct)
 TEST_NAMES = 0_0_cluster 0_0_scatter 0_0_lines 0_0_expwilds 0_0_ways 0_0_lines_feature_match
 
 ifeq ($(OS),Windows_NT)

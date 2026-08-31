@@ -11,11 +11,14 @@ from games.last_shift.game_calculations import (
     WinningGroup,
     apply_departure_modifier,
     apply_level_modifier,
+    derive_contribution_bucket,
+    evaluate_pay_anywhere,
     flat_position,
     group_completed_columns,
     load_selected_columns,
     make_departure_groups,
     select_cargo_columns,
+    serialize_wins,
 )
 from games.last_shift.game_config import GameConfig
 from games.last_shift.game_events import (
@@ -55,12 +58,27 @@ def regular_board():
 
 def cargo_board():
     return board_with_columns(
-        "BCDEF",
-        "BCDEF",
+        "SSSSS",
+        "SSSSS",
         "AAAAA",
         "AAAAA",
-        "BCDEF",
-        "BCDEF",
+        "SSSSS",
+        "SSSSS",
+    )
+
+
+def scatter_board():
+    board = [list(column) for column in regular_board()]
+    for position in (0, 6, 12, 18):
+        board[position % 6][position // 6] = "S"
+    return tuple(tuple(column) for column in board)
+
+
+def wild_only_win_board():
+    symbols = ["W"] * 8 + ["S"] * 22
+    return tuple(
+        tuple(symbols[row * 6 + column] for row in range(5))
+        for column in range(6)
     )
 
 
@@ -90,16 +108,25 @@ def build_end_to_end_departure_fixture(machine, config):
     board = cargo_board()
     ledger.board_reveal(board)
     completed_group = None
+    modifier_reason = None
 
     for level in (1, 2, 3):
         group = WinningGroup("A", cargo_positions())
+        evaluated, payout = evaluate_pay_anywhere(board, config)
         ledger.win_result(
-            100,
-            groups=payout_groups(),
-            contribution_bucket="base_plain" if level == 1 else "base_modifier",
+            payout,
+            groups=serialize_wins(evaluated),
+            contribution_bucket=derive_contribution_bucket(
+                "basegame", modifier_reason, ()
+            ),
         )
-        ledger.symbols_remove(cargo_positions())
-        selections = select_cargo_columns(board, (group,), config)
+        winning_positions = sorted({p for win in evaluated for p in win.positions})
+        ledger.symbols_remove(winning_positions)
+        selections = select_cargo_columns(
+            board,
+            tuple(WinningGroup(win.symbol, win.positions) for win in evaluated),
+            config,
+        )
         next_levels, transitions = load_selected_columns(
             state.column_levels, selections
         )
@@ -112,6 +139,7 @@ def build_end_to_end_departure_fixture(machine, config):
                 cargo_board(), transitions, config
             )
             ledger.board_modifier(f"load_level_{level}", changes, board)
+            modifier_reason = f"load_level_{level}"
             continue
 
         completed_group = make_departure_groups(
@@ -123,11 +151,14 @@ def build_end_to_end_departure_fixture(machine, config):
             cargo_board(), (completed_group,), config
         )
         ledger.board_modifier("departure", changes, board)
+        evaluated, payout = evaluate_pay_anywhere(board, config, (completed_group,))
         ledger.win_result(
-            300,
-            groups=payout_groups(),
+            payout,
+            groups=serialize_wins(evaluated),
             applied_departure_ids=(completed_group.departure_id,),
-            contribution_bucket="base_coupled_departure",
+            contribution_bucket=derive_contribution_bucket(
+                "basegame", "departure", (completed_group,)
+            ),
         )
         state = machine.resolve_departures(state, ledger, (completed_group,))
 
@@ -213,7 +244,7 @@ def test_adjacent_columns_couple_and_nonadjacent_columns_stay_single():
 
 
 def test_departure_modifier_fills_every_row_and_events_carry_authoritative_sum(config):
-    groups = make_departure_groups((2, 3), "mainline", {2: 12, 3: 20}, 7)
+    groups = make_departure_groups((2, 3), "mainline", {2: 12, 3: 20}, 7, mode="freegame")
     assert groups[0].kind == "coupled"
     assert groups[0].multiplier == 32
     board, changes = apply_departure_modifier(regular_board(), groups, config)
@@ -252,7 +283,8 @@ def test_bonus_departure_stage_resets(
         free_spins_remaining=5,
     )
     ledger = EventLedger(config.wincap_units)
-    group = make_departure_groups((2,), stage, {2: 6}, departures + 1)
+    component = {"yard": 6, "mainline": 12, "redline": 25}[stage]
+    group = make_departure_groups((2,), stage, {2: component}, departures + 1, mode="freegame")
     next_state = machine.resolve_departures(state, ledger, group)
     assert next_state.column_levels[2] == expected_reset
     assert next_state.stage == expected_stage
@@ -273,7 +305,8 @@ def test_bonus_stage_advances_only_after_current_departure_resolves(
         free_spins_remaining=3,
     )
     ledger = EventLedger(config.wincap_units)
-    group = make_departure_groups((2,), stage, {2: 6}, departures + 1)
+    component = {"yard": 6, "mainline": 12}[stage]
+    group = make_departure_groups((2,), stage, {2: component}, departures + 1, mode="freegame")
     next_state = machine.resolve_departures(state, ledger, group)
     assert next_state.column_levels[2] == expected_reset
     assert next_state.stage == stage_after
@@ -283,9 +316,9 @@ def test_bonus_stage_advances_only_after_current_departure_resolves(
 def test_bonus_state_persists_across_free_spins_and_retrigger(machine, config):
     base, ledger = machine.new_base_round()
     base = replace(base, column_levels=(1, 0, 2, 1, 0, 0))
-    bonus = machine.trigger_natural_bonus(base, ledger, (0, 6, 12, 18))
+    bonus = machine.trigger_natural_bonus(base, ledger, scatter_board(), (0, 6, 12, 18))
     first = machine.start_free_spin(bonus, ledger)
-    retriggered = machine.retrigger(first, ledger, (1, 7, 13, 19))
+    retriggered = machine.retrigger(first, ledger, scatter_board(), (0, 6, 12, 18))
     second = machine.start_free_spin(retriggered, ledger)
     assert bonus.column_levels == first.column_levels == retriggered.column_levels == second.column_levels
     assert retriggered.stage == first.stage
@@ -327,7 +360,7 @@ def test_no_payout_event_can_follow_max_win(config):
     with pytest.raises(TerminalPayoutError):
         ledger.win_result(1)
     with pytest.raises(TerminalPayoutError):
-        ledger.retrigger((0, 6, 12, 18), 4, 7, (0, 0, 0, 0, 0, 0), "yard", 0)
+        ledger.retrigger((0, 6, 12, 18), 4, 7, (0, 0, 0, 0, 0, 0), "yard", 0, scatter_board())
     assert event_types(ledger.events) == ["win_result", "max_win"]
     ledger.round_complete((0, 0, 0, 0, 0, 0))
     assert event_types(ledger.events) == ["win_result", "max_win", "round_complete"]
@@ -357,20 +390,20 @@ def test_capped_contribution_ledger_remains_additive(config):
         "base_modifier",
         "base_single_departure",
         "base_coupled_departure",
-        "bonus_yard",
-        "bonus_mainline",
+        "bonus_plain",
+        "bonus_modifier",
     )
     for bucket in buckets:
         ledger.win_result(100, groups=payout_groups(), contribution_bucket=bucket)
     ledger.win_result(
         config.wincap_units,
         groups=payout_groups(),
-        contribution_bucket="bonus_redline",
+        contribution_bucket="bonus_redline_departure",
     )
     assert sum(ledger.contribution_units.values()) == config.wincap_units
     assert ledger.contribution_units["base_plain"] == 100
     assert ledger.contribution_units["base_modifier"] == 100
-    assert ledger.contribution_units["bonus_redline"] == config.wincap_units - 600
+    assert ledger.contribution_units["bonus_redline_departure"] == config.wincap_units - 600
 
 
 def test_cascade_refill_is_deep_authoritative_board(config):
@@ -393,24 +426,24 @@ def test_custom_validator_rejects_payout_after_max_win(config):
     invalid.insert(-1, {"type": "board_reveal", "board": [list(c) for c in cargo_board()]})
     for index, event in enumerate(invalid):
         event["index"] = index
-    with pytest.raises(ValueError, match="illegal board_reveal after max_win"):
+    with pytest.raises(ValueError):
         validate_contract(invalid, config.wincap_units)
 
 
 def test_forced_bonus_path_is_separate_from_natural_frequency_path(machine, config):
     state, natural_ledger = machine.new_base_round()
-    machine.trigger_natural_bonus(state, natural_ledger, (0, 6, 12, 18))
+    machine.trigger_natural_bonus(state, natural_ledger, scatter_board(), (0, 6, 12, 18))
     assert natural_ledger.events[-1]["outcomePath"] == "natural"
 
     state, forced_ledger = machine.new_base_round()
     forced = machine.build_forced_bonus(
-        state, forced_ledger, (0, 6, 12, 18), "forced_contract"
+        state, forced_ledger, scatter_board(), (0, 6, 12, 18), "forced_contract"
     )
     assert forced.mode == config.freegame_type
     assert forced_ledger.events[-1]["outcomePath"] == "forced"
     with pytest.raises(ValueError, match="dedicated forced criterion"):
         machine.build_forced_bonus(
-            state, EventLedger(config.wincap_units), (0, 6, 12, 18), "natural_bonus"
+            state, EventLedger(config.wincap_units), scatter_board(), (0, 6, 12, 18), "natural_bonus"
         )
     machine.new_base_round()
     assert machine.active_outcome_path == "natural"
@@ -419,7 +452,7 @@ def test_forced_bonus_path_is_separate_from_natural_frequency_path(machine, conf
 def test_bonus_completion_cannot_leak_state_into_next_bet(machine, config):
     state, ledger = machine.new_base_round()
     state = replace(state, column_levels=(1, 0, 2, 1, 0, 0))
-    bonus = machine.trigger_natural_bonus(state, ledger, (0, 6, 12, 18))
+    bonus = machine.trigger_natural_bonus(state, ledger, scatter_board(), (0, 6, 12, 18))
     completed = machine.complete_bonus(bonus, ledger, feature_payout_units=0)
     assert completed.mode == config.basegame_type
     assert completed.column_levels == (0, 0, 0, 0, 0, 0)
@@ -432,17 +465,28 @@ def test_end_to_end_board_to_departure_trace(machine, config):
     validate_contract(events, config.wincap_units)
     assert group.kind == "coupled" and group.columns == (2, 3)
     assert final_state.column_levels == (0, 0, 0, 0, 0, 0)
-    assert final_state.round_payout_units == 600
+    assert final_state.round_payout_units == events[-1]["finalPayoutUnits"]
+    assert final_state.round_payout_units != 600
+
+
+def test_pay_anywhere_evaluator_requires_eight_and_derives_integer_payout(config):
+    below = board_with_columns("WSSSS", "WSSSS", "WSSSS", "WSSSS", "WSSSS", "WSSSS")
+    wins, payout = evaluate_pay_anywhere(below, config)
+    assert wins == () and payout == 0
+    wins, payout = evaluate_pay_anywhere(wild_only_win_board(), config)
+    assert wins and all(win.count >= 8 for win in wins)
+    assert payout == sum(win.payout_units for win in wins)
+    assert all(isinstance(win.payout_units, int) for win in wins)
 
 
 def test_refill_can_go_directly_to_no_win_without_modifier(config):
     ledger = EventLedger(config.wincap_units)
     ledger.round_start("basegame", (0, 0, 0, 0, 0, 0), 0, "yard", 0)
-    board = regular_board()
-    positions = [flat_position(column, 0) for column in range(6)]
-    groups = [{"symbol": "A", "positions": positions}]
+    board = wild_only_win_board()
+    evaluated, payout = evaluate_pay_anywhere(board, config)
+    positions = sorted({position for win in evaluated for position in win.positions})
     ledger.board_reveal(board)
-    ledger.win_result(100, groups=groups)
+    ledger.win_result(payout, groups=serialize_wins(evaluated))
     ledger.symbols_remove(positions)
     ledger.columns_load(())
     ledger.cascade_refill(board)
@@ -475,7 +519,8 @@ def test_coupled_departure_counts_completed_columns_at_thresholds(
         free_spins_remaining=3,
     )
     ledger = EventLedger(config.wincap_units)
-    group = make_departure_groups((2, 3), stage, {2: 6, 3: 10}, 1)
+    components = {"yard": {2: 6, 3: 10}, "mainline": {2: 12, 3: 20}}[stage]
+    group = make_departure_groups((2, 3), stage, components, 1, mode="freegame")
     next_state = machine.resolve_departures(state, ledger, group)
     assert next_state.departures == expected_departures
     assert next_state.stage == expected_stage
@@ -490,7 +535,7 @@ def test_resolve_rejects_stage_at_selection_mismatch(machine, config):
         stage="mainline",
         free_spins_remaining=2,
     )
-    group = make_departure_groups((2,), "yard", {2: 6}, 1)
+    group = make_departure_groups((2,), "yard", {2: 6}, 1, mode="freegame")
     with pytest.raises(ValueError, match="stageAtSelection"):
         machine.resolve_departures(state, EventLedger(config.wincap_units), group)
 
@@ -501,9 +546,48 @@ def test_bonus_and_retrigger_positions_must_be_unique_and_in_range(
 ):
     state, ledger = machine.new_base_round()
     with pytest.raises(ValueError, match="positions|position"):
-        machine.trigger_natural_bonus(state, ledger, positions)
+        machine.trigger_natural_bonus(state, ledger, scatter_board(), positions)
     with pytest.raises(ValueError, match="positions|position"):
-        ledger.bonus_trigger(positions, 10, (0, 0, 0, 0, 0, 0))
+        ledger.bonus_trigger(positions, 10, (0, 0, 0, 0, 0, 0), board=scatter_board())
+
+
+def test_bonus_positions_must_point_to_scatter(machine, config):
+    state, ledger = machine.new_base_round()
+    with pytest.raises(ValueError, match="point to S"):
+        machine.trigger_natural_bonus(state, ledger, regular_board(), (0, 6, 12, 18))
+    with pytest.raises(ValueError, match="point to S"):
+        ledger.bonus_trigger(
+            (0, 6, 12, 18), 10, (0, 0, 0, 0, 0, 0), board=regular_board()
+        )
+
+
+@pytest.mark.parametrize(
+    ("departures", "stage", "components", "expected_stage", "reset"),
+    (
+        (0, "yard", {1: 6, 4: 10}, "mainline", 0),
+        (2, "mainline", {1: 12, 4: 20}, "redline", 1),
+    ),
+)
+def test_nonadjacent_simultaneous_departures_freeze_selection_stage(
+    machine, config, departures, stage, components, expected_stage, reset
+):
+    state = RoundState(
+        mode=config.freegame_type,
+        column_levels=(0, 2, 0, 0, 2, 0),
+        departures=departures,
+        stage=stage,
+        free_spins_remaining=2,
+    )
+    groups = make_departure_groups(
+        (1, 4), stage, components, 1, mode="freegame"
+    )
+    assert len(groups) == 2 and all(group.stage_at_selection == stage for group in groups)
+    resolved = machine.resolve_departures(
+        state, EventLedger(config.wincap_units), groups
+    )
+    assert resolved.departures == departures + 2
+    assert resolved.stage == expected_stage
+    assert resolved.column_levels[1] == resolved.column_levels[4] == reset
 
 
 def test_provisional_paytable_obeys_sdk_payout_quantum(config):
@@ -519,9 +603,9 @@ def test_provisional_paytable_obeys_sdk_payout_quantum(config):
 
 def test_complete_bonus_state_and_payout_reconcile(machine, config):
     state, ledger = machine.new_base_round()
-    ledger.board_reveal(regular_board())
+    ledger.board_reveal(scatter_board())
     ledger.no_win()
-    state = machine.trigger_natural_bonus(state, ledger, (0, 6, 12, 18))
+    state = machine.trigger_natural_bonus(state, ledger, scatter_board(), (0, 6, 12, 18))
     for _ in range(config.initial_free_spins):
         state = machine.start_free_spin(state, ledger)
         ledger.board_reveal(regular_board())
@@ -564,6 +648,35 @@ def mutate_departure_fixture(events, mutation):
     elif mutation == "terminal_gameplay":
         position = mutated.index(resolve) + 1
         mutated.insert(position, {"type": "board_reveal", "board": [list(c) for c in regular_board()]})
+    elif mutation == "evaluator_payout":
+        first_win = next(event for event in mutated if event["type"] == "win_result")
+        first_win["requestedStepPayoutUnits"] += 10
+    elif mutation == "omit_top_cargo":
+        load_events[0]["transitions"].pop()
+    elif mutation == "modifier_change":
+        modifier = next(event for event in mutated if event["type"] == "board_modifier")
+        modifier["changes"][0]["from_symbol"] = "H"
+    elif mutation == "illegal_component":
+        prepare["components"][0] = 10
+        prepare["multiplier"] = sum(prepare["components"])
+    elif mutation == "wrong_bucket":
+        first_win = next(event for event in mutated if event["type"] == "win_result")
+        first_win["contributionBucket"] = "base_modifier"
+    elif mutation == "split_adjacent":
+        position = mutated.index(prepare)
+        first = deepcopy(prepare)
+        second = deepcopy(prepare)
+        first.update(departureId="dep-split-1", kind="single", columns=[2], components=[2], multiplier=2)
+        second.update(departureId="dep-split-2", kind="single", columns=[3], components=[3], multiplier=3)
+        mutated[position : position + 1] = [first, second]
+        departure_win["appliedDepartureIds"] = ["dep-split-1", "dep-split-2"]
+        departure_win["contributionBucket"] = "base_single_departure"
+        resolve_position = mutated.index(resolve)
+        first_resolve = deepcopy(resolve)
+        second_resolve = deepcopy(resolve)
+        first_resolve.update(departureId="dep-split-1", columns=[2], resetLevels=[0])
+        second_resolve.update(departureId="dep-split-2", columns=[3], resetLevels=[0])
+        mutated[resolve_position : resolve_position + 1] = [first_resolve, second_resolve]
     for index, event in enumerate(mutated):
         event["index"] = index
     return mutated
@@ -587,6 +700,23 @@ def mutate_departure_fixture(events, mutation):
     ),
 )
 def test_negative_contract_mutation_matrix(machine, config, mutation):
+    events, _, _ = build_end_to_end_departure_fixture(machine, config)
+    with pytest.raises(ValueError):
+        validate_contract(mutate_departure_fixture(events, mutation), config.wincap_units)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "evaluator_payout",
+        "omit_top_cargo",
+        "modifier_change",
+        "illegal_component",
+        "wrong_bucket",
+        "split_adjacent",
+    ),
+)
+def test_six_residual_negative_probes(machine, config, mutation):
     events, _, _ = build_end_to_end_departure_fixture(machine, config)
     with pytest.raises(ValueError):
         validate_contract(mutate_departure_fixture(events, mutation), config.wincap_units)

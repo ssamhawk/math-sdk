@@ -56,6 +56,24 @@ class DepartureGroup:
     stage_at_selection: str
 
 
+@dataclass(frozen=True)
+class EvaluatedWin:
+    symbol: str
+    positions: tuple[int, ...]
+    count: int
+    base_payout_units: int
+    multiplier: int
+    payout_units: int
+
+
+ALLOWED_COMPONENTS = {
+    ("basegame", "yard"): {2, 3, 4},
+    ("freegame", "yard"): {6, 10, 15},
+    ("freegame", "mainline"): {12, 20, 30},
+    ("freegame", "redline"): {25, 40, 60, 100},
+}
+
+
 def validate_board(board: Board, config: GameConfig) -> None:
     if len(board) != config.num_reels:
         raise ValueError("board must have exactly six columns")
@@ -79,6 +97,81 @@ def coordinates(position: int, columns: int = 6, rows: int = 5) -> tuple[int, in
 def symbol_at(board: Board, position: int) -> str:
     column, row = coordinates(position, len(board), len(board[0]))
     return board[column][row]
+
+
+def evaluate_pay_anywhere(
+    board: Board, config: GameConfig, departures: Sequence[DepartureGroup] = ()
+) -> tuple[tuple[EvaluatedWin, ...], int]:
+    """Pure scatter-pay evaluator from the authoritative board."""
+    validate_board(board, config)
+    wins = []
+    for symbol in config.regular_symbols:
+        positions = tuple(
+            flat_position(column, row, config.num_reels)
+            for column in range(config.num_reels)
+            for row in range(config.num_rows[column])
+            if board[column][row] in (symbol, "W")
+        )
+        count = len(positions)
+        if count < config.minimum_scatter_pay_count:
+            continue
+        base_payout = config.paytable_units[(count, symbol)]
+        relevant = [
+            group
+            for group in departures
+            if any(position % config.num_reels in group.columns for position in positions)
+        ]
+        multiplier = sum(group.multiplier for group in relevant) if relevant else 1
+        wins.append(
+            EvaluatedWin(
+                symbol,
+                tuple(sorted(positions)),
+                count,
+                base_payout,
+                multiplier,
+                base_payout * multiplier,
+            )
+        )
+    return tuple(wins), sum(win.payout_units for win in wins)
+
+
+def serialize_wins(wins: Sequence[EvaluatedWin]) -> list[dict[str, object]]:
+    return [
+        {
+            "symbol": win.symbol,
+            "positions": list(win.positions),
+            "count": win.count,
+            "basePayoutUnits": win.base_payout_units,
+            "multiplier": win.multiplier,
+            "payoutUnits": win.payout_units,
+        }
+        for win in wins
+    ]
+
+
+def derive_contribution_bucket(
+    mode: str, modifier_reason: str | None, departures: Sequence[DepartureGroup]
+) -> str:
+    if departures:
+        if mode == "basegame":
+            return (
+                "base_coupled_departure"
+                if any(group.kind == "coupled" for group in departures)
+                else "base_single_departure"
+            )
+        return f"bonus_{departures[0].stage_at_selection}_departure"
+    if mode == "basegame":
+        return "base_modifier" if modifier_reason else "base_plain"
+    return "bonus_modifier" if modifier_reason else "bonus_plain"
+
+
+def modifier_reason_for(transitions: Sequence[LoadTransition]) -> str:
+    levels = sorted({transition.level_after for transition in transitions})
+    return (
+        f"load_level_{levels[0]}"
+        if len(levels) == 1
+        else "load_levels_" + "_".join(str(level) for level in levels)
+    )
 
 
 def select_cargo_columns(
@@ -189,9 +282,16 @@ def make_departure_groups(
     stage: str,
     component_by_column: dict[int, int],
     departure_sequence: int,
+    mode: str = "basegame",
 ) -> tuple[DepartureGroup, ...]:
     if stage not in ("yard", "mainline", "redline"):
         raise ValueError("unknown departure stage")
+    completed_columns = tuple(completed_columns)
+    allowed = ALLOWED_COMPONENTS.get((mode, stage))
+    if allowed is None:
+        raise ValueError("departure mode/stage combination is invalid")
+    if any(component_by_column[column] not in allowed for column in set(completed_columns)):
+        raise ValueError("departure component is not allowed for mode/stage")
     groups = []
     for offset, columns in enumerate(group_completed_columns(completed_columns)):
         components = tuple(component_by_column[column] for column in columns)
