@@ -23,8 +23,19 @@ FROZEN_VALIDATE_CONTRACT_HASH = (
 )
 
 
+@pytest.fixture(autouse=True)
+def restore_game_config_singleton():
+    config = GameConfig()
+    snapshot = deepcopy(vars(config))
+    try:
+        yield
+    finally:
+        vars(config).clear()
+        vars(config).update(snapshot)
+
+
 def make_game(tmp_path):
-    config = deepcopy(GameConfig())
+    config = GameConfig()
     config.game_id = str(tmp_path / "last_shift_contract_proof_direct")
     config.construct_paths()
     game = GameState(config)
@@ -109,14 +120,18 @@ def test_release_and_default_output_guards_fail_before_mutation(tmp_path):
         nonlocal called
         called = True
 
-    proof_config = deepcopy(GameConfig())
-    proof_config.contract_proof_only = False
-    with pytest.raises(RuntimeError, match="not publishable"):
-        build_release(
-            config=proof_config,
-            publish_action=downstream,
-            num_sim_args={"contract_proof": 2},
-        )
+    proof_config = GameConfig()
+    marker_before = proof_config.contract_proof_only
+    try:
+        proof_config.contract_proof_only = False
+        with pytest.raises(RuntimeError, match="not publishable"):
+            build_release(
+                config=proof_config,
+                publish_action=downstream,
+                num_sim_args={"contract_proof": 2},
+            )
+    finally:
+        proof_config.contract_proof_only = marker_before
     assert called is False
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -126,7 +141,9 @@ def test_release_and_default_output_guards_fail_before_mutation(tmp_path):
         for path in real_library.rglob("*")
         if path.is_file()
     ) if real_library.exists() else []
-    default_config = deepcopy(GameConfig())
+    default_config = GameConfig()
+    default_config.game_id = "last_shift"
+    default_config.construct_paths()
     game = GameState(default_config)
     game.betmode = "contract_proof"
     game.criteria = "contract_loss"
@@ -151,7 +168,7 @@ def test_release_and_default_output_guards_fail_before_mutation(tmp_path):
             profiling=False,
         )
 
-    split_config = deepcopy(GameConfig())
+    split_config = GameConfig()
     split_game = GameState(split_config)
     split_game.output_files.library_path = str(tmp_path / "decoy_library")
     split_game.betmode = "contract_proof"
@@ -165,6 +182,26 @@ def test_release_and_default_output_guards_fail_before_mutation(tmp_path):
     assert split_game.book.to_json() == split_book_before
     assert split_game.library == split_library_before
     assert split_game._payout_ints == split_payouts_before
+
+    relative_config, relative_game = make_game(tmp_path)
+    relative_game.output_files.book_path = "games/last_shift/library/books"
+    relative_game.criteria = "contract_loss"
+    relative_book_before = deepcopy(relative_game.book.to_json())
+    relative_library_before = deepcopy(relative_game.library)
+    relative_payouts_before = list(relative_game._payout_ints)
+    relative_target = (
+        repo_root / "games" / "last_shift" / "library" / "books"
+    ).resolve()
+
+    with pytest.raises(RuntimeError) as relative_error:
+        relative_game.run_spin(0, 3)
+    assert str(relative_target) in str(relative_error.value)
+    assert relative_game.book.to_json() == relative_book_before
+    assert relative_game.library == relative_library_before
+    assert relative_game._payout_ints == relative_payouts_before
+    assert relative_config.game_id == str(
+        tmp_path / "last_shift_contract_proof_direct"
+    )
 
     files_after = sorted(
         str(path.relative_to(real_library))
@@ -336,7 +373,7 @@ def test_create_books_pipeline_isolated_in_subprocess(tmp_path):
 def _run_create_books_probe(isolated_game):
     from src.state.run_sims import create_books
 
-    config = deepcopy(GameConfig())
+    config = GameConfig()
     config.game_id = str(isolated_game)
     config.construct_paths()
     game = GameState(config)

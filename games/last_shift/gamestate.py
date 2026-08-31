@@ -358,9 +358,7 @@ class GameState(GeneralGameState):
         while values:
             value = values.pop()
             if isinstance(value, (str, Path)):
-                path = Path(value)
-                if path.is_absolute():
-                    yield path.resolve()
+                yield Path(value).resolve()
                 continue
 
             if isinstance(value, dict):
