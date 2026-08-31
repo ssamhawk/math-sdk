@@ -23,8 +23,10 @@ FROZEN_VALIDATE_CONTRACT_HASH = (
 )
 
 
-def make_game():
-    config = GameConfig()
+def make_game(tmp_path):
+    config = deepcopy(GameConfig())
+    config.game_id = str(tmp_path / "last_shift_contract_proof_direct")
+    config.construct_paths()
     game = GameState(config)
     game.betmode = "contract_proof"
     return config, game
@@ -98,24 +100,66 @@ def test_contract_proof_config_is_exact_and_not_publishable():
         config.assert_publishable_config()
 
 
-def test_release_guard_fails_before_downstream_publish_action():
+def test_release_and_default_output_guards_fail_before_mutation(tmp_path):
+    from src.state.run_sims import create_books
+
     called = False
 
     def downstream(*args, **kwargs):
         nonlocal called
         called = True
 
+    proof_config = deepcopy(GameConfig())
+    proof_config.contract_proof_only = False
     with pytest.raises(RuntimeError, match="not publishable"):
         build_release(
-            config=GameConfig(),
+            config=proof_config,
             publish_action=downstream,
             num_sim_args={"contract_proof": 2},
         )
     assert called is False
 
+    repo_root = Path(__file__).resolve().parents[1]
+    real_library = repo_root / "games" / "last_shift" / "library"
+    files_before = sorted(
+        str(path.relative_to(real_library))
+        for path in real_library.rglob("*")
+        if path.is_file()
+    ) if real_library.exists() else []
+    default_config = deepcopy(GameConfig())
+    game = GameState(default_config)
+    game.betmode = "contract_proof"
+    game.criteria = "contract_loss"
+    book_before = deepcopy(game.book.to_json())
+    library_before = deepcopy(game.library)
+    payouts_before = list(game._payout_ints)
 
-def test_loss_book_uses_sdk_accounting_and_independent_validation():
-    config, game = make_game()
+    with pytest.raises(RuntimeError, match="canonical Last Shift library"):
+        game.run_spin(0, 1)
+    assert game.book.to_json() == book_before
+    assert game.library == library_before
+    assert game._payout_ints == payouts_before
+
+    with pytest.raises(RuntimeError, match="canonical Last Shift library"):
+        create_books(
+            game,
+            default_config,
+            {"contract_proof": 2},
+            batch_size=2,
+            threads=1,
+            compress=False,
+            profiling=False,
+        )
+    files_after = sorted(
+        str(path.relative_to(real_library))
+        for path in real_library.rglob("*")
+        if path.is_file()
+    ) if real_library.exists() else []
+    assert files_after == files_before
+
+
+def test_loss_book_uses_sdk_accounting_and_independent_validation(tmp_path):
+    config, game = make_game(tmp_path)
     assert isinstance(game, GameState)
     book = run_criterion(game, "contract_loss")
 
@@ -131,8 +175,8 @@ def test_loss_book_uses_sdk_accounting_and_independent_validation():
     assert_reconciled(config, game, book)
 
 
-def test_departure_book_uses_sdk_accounting_and_independent_validation():
-    config, game = make_game()
+def test_departure_book_uses_sdk_accounting_and_independent_validation(tmp_path):
+    config, game = make_game(tmp_path)
     book = run_criterion(game, "contract_departure")
     types = [event["type"] for event in book["events"]]
 
@@ -149,8 +193,8 @@ def test_departure_book_uses_sdk_accounting_and_independent_validation():
     assert_reconciled(config, game, book)
 
 
-def test_reproducibility_and_cross_run_reset_on_one_instance():
-    config, game = make_game()
+def test_reproducibility_and_cross_run_reset_on_one_instance(tmp_path):
+    config, game = make_game(tmp_path)
     first_departure = run_criterion(game, "contract_departure", sim=7, seed=9001)
     second_departure = run_criterion(game, "contract_departure", sim=7, seed=9001)
     assert second_departure == first_departure
@@ -190,8 +234,8 @@ def test_reproducibility_and_cross_run_reset_on_one_instance():
     validate_contract(third_departure["events"], config.wincap_units)
 
 
-def test_unknown_criterion_fails_before_library_publication():
-    _, game = make_game()
+def test_unknown_criterion_fails_before_library_publication(tmp_path):
+    _, game = make_game(tmp_path)
     library_before = deepcopy(game.library)
     payout_before = list(game._payout_ints)
     game.criteria = "unknown"
@@ -201,8 +245,8 @@ def test_unknown_criterion_fails_before_library_publication():
     assert game._payout_ints == payout_before
 
 
-def test_cumulative_sdk_accounting_and_mutated_copy_rejection():
-    config, game = make_game()
+def test_cumulative_sdk_accounting_and_mutated_copy_rejection(tmp_path):
+    config, game = make_game(tmp_path)
     loss = run_criterion(game, "contract_loss", sim=0, seed=1)
     departure = run_criterion(game, "contract_departure", sim=1, seed=2)
     expected_multiplier = sum(
@@ -276,7 +320,7 @@ def test_create_books_pipeline_isolated_in_subprocess(tmp_path):
 def _run_create_books_probe(isolated_game):
     from src.state.run_sims import create_books
 
-    config = GameConfig()
+    config = deepcopy(GameConfig())
     config.game_id = str(isolated_game)
     config.construct_paths()
     game = GameState(config)

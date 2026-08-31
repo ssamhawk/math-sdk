@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from pathlib import Path
 import random
 from typing import Sequence
 
@@ -26,6 +27,7 @@ from games.last_shift.game_calculations import (
 from games.last_shift.contract_fixtures import CARGO_BOARD, LOSS_BOARD
 from games.last_shift.game_config import GameConfig
 from games.last_shift.game_events import EventLedger
+from src.config.paths import PATH_TO_GAMES
 from src.state.state import GeneralGameState
 
 
@@ -319,6 +321,7 @@ class GameState(GeneralGameState):
         raise RuntimeError("contract_proof does not cover freegame integration")
 
     def run_spin(self, sim: int, simulation_seed=None) -> None:
+        self._assert_contract_output_isolated()
         if self.criteria not in self._SUPPORTED_CRITERIA:
             raise ValueError(f"unsupported contract_proof criterion: {self.criteria}")
 
@@ -334,6 +337,19 @@ class GameState(GeneralGameState):
         self.update_final_win()
         self._last_shift_state = final_state
         self.imprint_wins()
+
+    def _assert_contract_output_isolated(self) -> None:
+        canonical_library = (
+            Path(PATH_TO_GAMES) / "last_shift" / "library"
+        ).resolve()
+        target_library = Path(self.output_files.library_path).resolve()
+        if (
+            target_library == canonical_library
+            or canonical_library in target_library.parents
+        ):
+            raise RuntimeError(
+                "contract_proof cannot write to the canonical Last Shift library"
+            )
 
     def _produce_contract_book(self, criterion: str) -> tuple[EventLedger, RoundState]:
         state = RoundState()

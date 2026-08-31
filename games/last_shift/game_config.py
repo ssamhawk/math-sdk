@@ -149,5 +149,14 @@ class GameConfig(Config):
 
     def assert_publishable_config(self) -> None:
         """Reject the deterministic contract fixture at every release boundary."""
-        if self.contract_proof_only:
+        proof_criteria = {"contract_loss", "contract_departure"}
+        has_proof_mode = any(
+            mode.get_name() == "contract_proof" for mode in self.bet_modes
+        )
+        has_proof_criteria = any(
+            distribution.get_criteria() in proof_criteria
+            for mode in self.bet_modes
+            for distribution in mode.get_distributions()
+        )
+        if self.contract_proof_only or has_proof_mode or has_proof_criteria:
             raise RuntimeError("contract_proof configuration is not publishable")
